@@ -1,0 +1,13 @@
+.env
+*.key
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.streamlit/secrets.toml
+.venv/
+venv/
+dist/
+build/
+*.log
+data/pm_stats/**/*.xlsx
+data/pm_stats/**/*.xls

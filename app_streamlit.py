@@ -8,6 +8,7 @@ import pandas as pd
 import streamlit as st
 
 from core.agent import AgentRequest, REGION_CATALOG, run_cleaning_agent
+from core.agent_llm import run_llm_agent
 from core.lcoe import DEFAULT_INPUTS, LcoeInputs
 from core.pm_statistics import RegionPair, available_years, list_pm_stat_files, list_region_pairs, pm_stats_dir
 
@@ -107,6 +108,53 @@ def _priority_frame(result) -> pd.DataFrame:
     )
 
 
+def _render_trace(trace: list[dict]) -> None:
+    if not trace:
+        st.info("추론 과정이 기록되지 않았습니다.")
+        return
+
+    st.subheader("에이전트 추론 과정")
+    tool_step = 0
+    i = 0
+    while i < len(trace):
+        item = trace[i]
+        kind = item.get("type")
+
+        if kind == "llm_response":
+            text = item.get("text") or ""
+            if text.strip():
+                is_final = item.get("stop_reason") == "end_turn"
+                label = "📝 최종 응답 (LLM)" if is_final else "💭 LLM 추론"
+                with st.expander(label, expanded=is_final):
+                    st.markdown(text)
+            i += 1
+
+        elif kind == "tool_call":
+            tool_name = item["tool"]
+            tool_input = item.get("input", {})
+            result_text = ""
+            consume = 1
+            if i + 1 < len(trace) and trace[i + 1].get("type") == "tool_result":
+                result_text = trace[i + 1].get("result", "")
+                consume = 2
+
+            tool_step += 1
+            with st.expander(f"🔧 Step {tool_step}: {tool_name}", expanded=False):
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("**입력**")
+                    st.json(tool_input)
+                with col2:
+                    st.markdown("**결과**")
+                    st.text(result_text)
+            i += consume
+
+        else:
+            i += 1
+
+
+# ── Sidebar ─────────────────────────────────────────────────────────────────
+
 st.title("청소 판단 에이전트")
 
 with st.sidebar:
@@ -150,65 +198,105 @@ with st.sidebar:
 
     lcoe_inputs = _build_lcoe_inputs()
 
+    st.divider()
+    agent_mode = st.toggle(
+        "에이전트 모드 (LLM)",
+        value=False,
+        help="Anthropic API를 호출해 LLM이 도구 순서를 직접 결정합니다. ANTHROPIC_API_KEY 필요. 30~60초 소요.",
+    )
+
     st.caption(f"PM 통계 폴더: {pm_stats_dir()}")
     st.caption(f"PM 통계 파일: {len(pm_files)}개")
     st.caption(f"KMA_API_KEY: {_env_status('KMA_API_KEY')}")
+    if agent_mode:
+        st.caption(f"ANTHROPIC_API_KEY: {_env_status('ANTHROPIC_API_KEY')}")
 
     run = st.button("분석 실행", type="primary", use_container_width=True)
 
 
-if "last_result" not in st.session_state or run:
-    with st.spinner("에이전트 분석 중"):
-        request = AgentRequest(
-            region_name=final_region,
-            region1=region1,
-            region2=region2,
-            lat=lat,
-            lon=lon,
-            end_date=end_date,
-            lookback_years=lookback_years,
-            use_live_data=use_live_data,
-            live_weather_days_limit=live_weather_days_limit,
-            top_n=top_n,
-            lcoe_inputs=lcoe_inputs,
-        )
-        st.session_state["last_result"] = run_cleaning_agent(request)
+# ── Run logic ────────────────────────────────────────────────────────────────
 
+if "last_result" not in st.session_state or run:
+    if agent_mode:
+        start_date = date(int(end_year) - lookback_years + 1, 1, 1)
+        with st.spinner("LLM 에이전트 분석 중 (30~60초 소요됩니다)..."):
+            st.session_state["last_result"] = run_llm_agent(
+                region_name=final_region,
+                start_date=start_date,
+                end_date=end_date,
+                lookback_years=lookback_years,
+                capacity_kw=lcoe_inputs.capacity,
+                top_n=top_n,
+            )
+        st.session_state["last_agent_mode"] = True
+    else:
+        with st.spinner("에이전트 분석 중"):
+            request = AgentRequest(
+                region_name=final_region,
+                region1=region1,
+                region2=region2,
+                lat=lat,
+                lon=lon,
+                end_date=end_date,
+                lookback_years=lookback_years,
+                use_live_data=use_live_data,
+                live_weather_days_limit=live_weather_days_limit,
+                top_n=top_n,
+                lcoe_inputs=lcoe_inputs,
+            )
+            st.session_state["last_result"] = run_cleaning_agent(request)
+        st.session_state["last_agent_mode"] = False
+
+
+# ── Main display ─────────────────────────────────────────────────────────────
 
 result = st.session_state["last_result"]
-daily_df = _daily_frame(result)
-priority_df = _priority_frame(result)
+is_agent_result = st.session_state.get("last_agent_mode", False)
 
-metric_cols = st.columns(4)
-metric_cols[0].metric("연평균 오염 손실", f"{result.pollution.annual_pollution_loss_pct:.2f}%")
-metric_cols[1].metric("연간 발전량 손실", f"{result.pollution.annual_generation_loss_kwh:,.0f} kWh")
-metric_cols[2].metric("반영 후 LCOE", f"{result.lcoe.ref_lcoe:.2f} 원/kWh", f"+{result.lcoe.lcoe_increase:.2f}%")
-metric_cols[3].metric("분석 지점", result.site.name)
+if result.pollution is not None and result.lcoe is not None and result.site is not None:
+    daily_df = _daily_frame(result)
+    priority_df = _priority_frame(result)
 
-left, right = st.columns([1.2, 0.8], gap="large")
-with left:
-    st.subheader("세척 우선순위")
-    st.dataframe(priority_df, use_container_width=True, hide_index=True)
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("연평균 오염 손실", f"{result.pollution.annual_pollution_loss_pct:.2f}%")
+    metric_cols[1].metric("연간 발전량 손실", f"{result.pollution.annual_generation_loss_kwh:,.0f} kWh")
+    metric_cols[2].metric("반영 후 LCOE", f"{result.lcoe.ref_lcoe:.2f} 원/kWh", f"+{result.lcoe.lcoe_increase:.2f}%")
+    metric_cols[3].metric("분석 지점", result.site.name)
 
-with right:
-    st.subheader("데이터 상태")
-    for note in result.data_notes:
-        st.write(f"- {note}")
+    left, right = st.columns([1.2, 0.8], gap="large")
+    with left:
+        st.subheader("세척 우선순위")
+        st.dataframe(priority_df, use_container_width=True, hide_index=True)
 
-st.subheader("오염 손실 추세")
-st.line_chart(daily_df[["soiling_loss_pct", "priority_score"]])
+    with right:
+        st.subheader("데이터 상태")
+        for note in result.data_notes:
+            st.write(f"- {note}")
 
-chart_cols = st.columns(2)
-with chart_cols[0]:
-    st.subheader("일 강수량")
-    st.bar_chart(daily_df[["rainfall_mm"]])
-with chart_cols[1]:
-    st.subheader("미세먼지")
-    st.line_chart(daily_df[["pm10", "pm25"]])
+    st.subheader("오염 손실 추세")
+    st.line_chart(daily_df[["soiling_loss_pct", "priority_score"]])
 
-st.subheader("리포트")
-st.markdown(result.report_markdown)
+    chart_cols = st.columns(2)
+    with chart_cols[0]:
+        st.subheader("일 강수량")
+        st.bar_chart(daily_df[["rainfall_mm"]])
+    with chart_cols[1]:
+        st.subheader("미세먼지")
+        st.line_chart(daily_df[["pm10", "pm25"]])
 
-with st.expander("모델 가정"):
-    for item in result.pollution.assumptions:
-        st.write(f"- {item}")
+    st.subheader("리포트")
+    st.markdown(result.report_markdown)
+
+    with st.expander("모델 가정"):
+        for item in result.pollution.assumptions:
+            st.write(f"- {item}")
+
+else:
+    # LLM result with partial data (e.g. error mid-way)
+    st.subheader("리포트")
+    st.markdown(result.report_markdown or "분석 결과가 없습니다.")
+
+# ── Agent trace panel ─────────────────────────────────────────────────────────
+
+if is_agent_result and hasattr(result, "trace"):
+    _render_trace(result.trace)

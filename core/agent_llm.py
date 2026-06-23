@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 agent_llm.py — LLM-driven cleaning decision agent using Anthropic tool use.
 Existing core tools are not modified — only wrapped with tool schemas.
@@ -405,7 +406,6 @@ def run_llm_agent(
             break
 
         if response.stop_reason != "tool_use":
-            # Unexpected stop — exit loop
             break
 
         # Execute each requested tool

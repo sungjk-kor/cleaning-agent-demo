@@ -10,13 +10,23 @@ import streamlit as st
 from core.agent import AgentRequest, REGION_CATALOG, run_cleaning_agent
 from core.agent_llm import run_llm_agent
 from core.lcoe import DEFAULT_INPUTS, LcoeInputs
-from core.pm_statistics import RegionPair, available_years, list_pm_stat_files, list_region_pairs, pm_stats_dir
+from core.pm_statistics import (
+    RegionPair, available_years, list_pm_stat_files, list_region_pairs,
+    pm_stats_dir, pm_cache_status, precompute_pm_cache,
+)
 
 
 st.set_page_config(
     page_title="청소 판단 에이전트",
     layout="wide",
 )
+
+# Streamlit Cloud secrets → 환경변수로 주입 (set_page_config 이후에만 안전하게 접근 가능)
+try:
+    if "ANTHROPIC_API_KEY" in st.secrets:
+        os.environ.setdefault("ANTHROPIC_API_KEY", st.secrets["ANTHROPIC_API_KEY"])
+except Exception:
+    pass
 
 
 def _env_status(name: str) -> str:
@@ -108,6 +118,11 @@ def _priority_frame(result) -> pd.DataFrame:
     )
 
 
+@st.dialog("분석 보고서", width="large")
+def _show_report_dialog(report_markdown: str) -> None:
+    st.markdown(report_markdown)
+
+
 def _render_trace(trace: list[dict]) -> None:
     if not trace:
         st.info("추론 과정이 기록되지 않았습니다.")
@@ -122,10 +137,13 @@ def _render_trace(trace: list[dict]) -> None:
 
         if kind == "llm_response":
             text = item.get("text") or ""
+            is_final = item.get("stop_reason") == "end_turn"
+            if is_final:
+                # 최종 보고서는 팝업 버튼으로 표시 — 여기서는 생략
+                i += 1
+                continue
             if text.strip():
-                is_final = item.get("stop_reason") == "end_turn"
-                label = "📝 최종 응답 (LLM)" if is_final else "💭 LLM 추론"
-                with st.expander(label, expanded=is_final):
+                with st.expander("💭 LLM 추론", expanded=False):
                     st.markdown(text)
             i += 1
 
@@ -153,7 +171,7 @@ def _render_trace(trace: list[dict]) -> None:
             i += 1
 
 
-# ── Sidebar ─────────────────────────────────────────────────────────────────
+# ── Sidebar ──────────────────────────────────────────────────────────────────
 
 st.title("청소 판단 에이전트")
 
@@ -211,10 +229,30 @@ with st.sidebar:
     if agent_mode:
         st.caption(f"ANTHROPIC_API_KEY: {_env_status('ANTHROPIC_API_KEY')}")
 
+    # PM 캐시 빌드 (파일이 있을 때만 표시)
+    if pm_files:
+        cached_n, total_n = pm_cache_status()
+        if cached_n < total_n:
+            with st.expander(f"⚠️ PM 캐시 미완성 ({cached_n}/{total_n})", expanded=True):
+                st.caption(
+                    f"Excel 파일 {total_n - cached_n}개가 캐시되지 않았습니다. "
+                    "캐시를 빌드하면 분석 속도가 크게 빨라집니다 (파일당 ~30초 소요)."
+                )
+                if st.button("PM 캐시 빌드", use_container_width=True):
+                    progress_bar = st.progress(0.0, text="캐시 빌드 중...")
+                    def _progress(done: int, total: int) -> None:
+                        progress_bar.progress(done / total, text=f"처리 중 {done}/{total}...")
+                    precompute_pm_cache(progress_callback=_progress)
+                    progress_bar.empty()
+                    st.success("캐시 빌드 완료! 분석이 빨라집니다.")
+                    st.rerun()
+        else:
+            st.caption(f"PM 캐시: {cached_n}/{total_n} 완료")
+
     run = st.button("분석 실행", type="primary", use_container_width=True)
 
 
-# ── Run logic ────────────────────────────────────────────────────────────────
+# ── Run logic ─────────────────────────────────────────────────────────────────
 
 if "last_result" not in st.session_state or run:
     if agent_mode:
@@ -248,7 +286,7 @@ if "last_result" not in st.session_state or run:
         st.session_state["last_agent_mode"] = False
 
 
-# ── Main display ─────────────────────────────────────────────────────────────
+# ── Main display ──────────────────────────────────────────────────────────────
 
 result = st.session_state["last_result"]
 is_agent_result = st.session_state.get("last_agent_mode", False)
@@ -273,6 +311,16 @@ if result.pollution is not None and result.lcoe is not None and result.site is n
         for note in result.data_notes:
             st.write(f"- {note}")
 
+    real_rain_used = any(
+        "KMA" in note and "반영" in note for note in (result.data_notes or [])
+    )
+    if not real_rain_used:
+        st.info(
+            "본 데모의 강수 데이터는 KMA 실측 연동 전 단계로, "
+            "통계 시뮬레이션 값을 사용합니다. 실측 API 연동은 로드맵에 포함돼 있습니다.",
+            icon="ℹ️",
+        )
+
     st.subheader("오염 손실 추세")
     st.line_chart(daily_df[["soiling_loss_pct", "priority_score"]])
 
@@ -284,19 +332,26 @@ if result.pollution is not None and result.lcoe is not None and result.site is n
         st.subheader("미세먼지")
         st.line_chart(daily_df[["pm10", "pm25"]])
 
-    st.subheader("리포트")
-    st.markdown(result.report_markdown)
+    if is_agent_result:
+        if st.button("📋 보고서 열기", type="secondary"):
+            _show_report_dialog(result.report_markdown)
+    else:
+        st.subheader("리포트")
+        st.markdown(result.report_markdown)
 
     with st.expander("모델 가정"):
         for item in result.pollution.assumptions:
             st.write(f"- {item}")
 
 else:
-    # LLM result with partial data (e.g. error mid-way)
-    st.subheader("리포트")
-    st.markdown(result.report_markdown or "분석 결과가 없습니다.")
+    if is_agent_result:
+        if st.button("📋 보고서 열기", type="secondary"):
+            _show_report_dialog(result.report_markdown or "")
+    else:
+        st.subheader("리포트")
+        st.markdown(result.report_markdown or "분석 결과가 없습니다.")
 
-# ── Agent trace panel ─────────────────────────────────────────────────────────
+# ── Agent trace panel ──────────────────────────────────────────────────────────
 
 if is_agent_result and hasattr(result, "trace"):
     _render_trace(result.trace)

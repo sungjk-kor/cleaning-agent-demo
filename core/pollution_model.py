@@ -20,7 +20,9 @@ class DailySoiling:
     pm10: float | None
     pm25: float | None
     dry_days: int
-    soiling_loss_pct: float
+    pm_based_soiling_pct: float  # PM 침적만 기반 손실
+    regional_weight_ppt: float  # 지역특성 가중치 (%p)
+    soiling_loss_pct: float  # 최종 = PM 손실 + 지역특성
     priority_score: float
 
 
@@ -45,6 +47,8 @@ class PollutionModelResult:
     daily: list[DailySoiling]
     priorities: list[CleaningPriority]
     annual_pollution_loss_pct: float
+    annual_pm_loss_pct: float  # PM 기반만
+    annual_regional_weight_ppt: float  # 지역특성 가중치
     annual_generation_loss_kwh: float
     assumptions: list[str]
 
@@ -53,6 +57,8 @@ class PollutionModelResult:
             "daily": [asdict(row) for row in self.daily],
             "priorities": [asdict(row) for row in self.priorities],
             "annual_pollution_loss_pct": self.annual_pollution_loss_pct,
+            "annual_pm_loss_pct": self.annual_pm_loss_pct,
+            "annual_regional_weight_ppt": self.annual_regional_weight_ppt,
             "annual_generation_loss_kwh": self.annual_generation_loss_kwh,
             "assumptions": self.assumptions,
         }
@@ -98,19 +104,23 @@ def build_daily_soiling(
     pm_by_date: Mapping[date, dict],
     start: date,
     end: date,
+    regional_weight_ppt: float = 0.0,
     max_loss_pct: float = 9.0,
 ) -> list[DailySoiling]:
     """
     Create a daily soiling trajectory from rain and particulate matter.
 
+    최종 소일링 손실 = PM 기반 손실 + 지역특성 가중치
+
     Heuristic:
       - PM10 and PM2.5 add a daily deposition increment.
       - Strong rain naturally washes accumulated soiling.
       - Long dry streaks amplify the cleaning priority score.
+      - Regional characteristics (agriculture, coastal, etc.) add fixed weight.
     """
     daily: list[DailySoiling] = []
     dry_days = 0
-    soiling = 0.0
+    pm_soiling = 0.0
 
     for d in _daterange(start, end):
         rainfall = float(rainfall_by_date.get(d, 0.0) or 0.0)
@@ -124,14 +134,15 @@ def build_daily_soiling(
 
         if rainfall >= 1:
             dry_days = 0
-            soiling *= _rain_washoff_factor(rainfall)
+            pm_soiling *= _rain_washoff_factor(rainfall)
         else:
             dry_days += 1
 
-        soiling = min(max_loss_pct, soiling + deposition)
+        pm_soiling = min(max_loss_pct, pm_soiling + deposition)
+        final_soiling = pm_soiling + (regional_weight_ppt / 100.0)
         dry_multiplier = 1 + min(dry_days, 45) / 45
         pm_multiplier = 1 + max(0.0, pm10_for_model - 35) / 120 + max(0.0, pm25_for_model - 20) / 90
-        priority_score = soiling * dry_multiplier * pm_multiplier
+        priority_score = final_soiling * dry_multiplier * pm_multiplier
 
         daily.append(
             DailySoiling(
@@ -140,7 +151,9 @@ def build_daily_soiling(
                 pm10=round(pm10, 2) if pm10 is not None else None,
                 pm25=round(pm25, 2) if pm25 is not None else None,
                 dry_days=dry_days,
-                soiling_loss_pct=round(soiling, 3),
+                pm_based_soiling_pct=round(pm_soiling, 3),
+                regional_weight_ppt=round(regional_weight_ppt, 3),
+                soiling_loss_pct=round(final_soiling, 3),
                 priority_score=round(priority_score, 3),
             )
         )
@@ -226,9 +239,16 @@ def simulate_cleaning_decision(
     capacity_kw: float,
     util_rate_pct: float,
     top_n: int = 5,
+    regional_weight_ppt: float = 0.0,
 ) -> PollutionModelResult:
-    """Run the full soiling model and return annual loss and top priorities."""
-    daily = build_daily_soiling(rainfall_by_date, pm_by_date, start, end)
+    """
+    Run the full soiling model with regional characteristics and return annual loss and top priorities.
+
+    최종 손실 = PM 기반 손실 + 지역특성 가중치
+    """
+    daily = build_daily_soiling(
+        rainfall_by_date, pm_by_date, start, end, regional_weight_ppt=regional_weight_ppt
+    )
     priorities = pick_cleaning_priorities(
         daily=daily,
         capacity_kw=capacity_kw,
@@ -237,8 +257,10 @@ def simulate_cleaning_decision(
     )
     if daily:
         annual_pollution_loss_pct = sum(row.soiling_loss_pct for row in daily) / len(daily)
+        annual_pm_loss_pct = sum(row.pm_based_soiling_pct for row in daily) / len(daily)
     else:
         annual_pollution_loss_pct = 0.0
+        annual_pm_loss_pct = 0.0
     annual_base_gen = capacity_kw * 8760 * (util_rate_pct / 100)
     annual_generation_loss = annual_base_gen * (annual_pollution_loss_pct / 100)
 
@@ -246,10 +268,13 @@ def simulate_cleaning_decision(
         daily=daily,
         priorities=priorities,
         annual_pollution_loss_pct=round(annual_pollution_loss_pct, 3),
+        annual_pm_loss_pct=round(annual_pm_loss_pct, 3),
+        annual_regional_weight_ppt=round(regional_weight_ppt, 3),
         annual_generation_loss_kwh=round(annual_generation_loss, 1),
         assumptions=[
             "PM10/PM2.5 농도는 일별 침적 증가량으로 환산합니다.",
             "1mm 이상 강수는 자연 세척 효과를 일부 반영하고, 10mm 이상은 강한 세척으로 간주합니다.",
+            "지역특성(농업, 산업, 해안 등)은 문헌 기반 고정 가중치로 반영됩니다. (IEA T13:21)",
             "세척 우선순위는 오염 손실률, 최근 건조일수, 최근 미세먼지 농도를 함께 반영합니다.",
             "현재 모델은 공개 데모용 설명 가능 휴리스틱이며, 현장 발전량/오염도 데이터로 보정 가능합니다.",
         ],

@@ -12,3 +12,4 @@ build/
 data/pm_stats/**/*.xlsx
 data/pm_stats/**/*.xls
 test_agent.py
+data/

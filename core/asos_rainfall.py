@@ -30,48 +30,37 @@ ASOS_DATA_DIR = Path(__file__).resolve().parents[1] / "data" / "raw_asos"
 ASOS_COLS_OF_INTEREST = ["지점", "지점명", "일시", "강수량(mm)", "강수량QC플래그"]
 
 
-def load_asos_daily_precip(
+def load_asos_hourly_precip(
     csv_path: Path | str, year: int | None = None
-) -> dict[str, dict[date, float]]:
+) -> dict[str, pd.Series]:
     """
-    ASOS 시간별 CSV → 지점별 일일강수량 테이블.
+    ASOS 시간별 CSV → 지점별 시간 강수량 시계열 (DatetimeIndex).
 
     Args:
         csv_path: OBS_ASOS_TIM_YYYY_all.csv 경로
         year: 연도 (검증용, 생략 가능)
 
     Returns:
-        {station_code: {date: mm, ...}, ...}
-        예) {"108": {date(2023,1,1): 12.5, ...}, ...}
+        {station_code: pd.Series(datetime_index, values=mm), ...}
+        예) {"108": Series(8760 rows, hourly)}
 
-    핵심 규칙:
-      - 비어있는 강수량 = 0mm (결측 아님, "비 오지 않은 시간")
-      - QC플래그 = 9 → 결측 = 0mm 처리하되, qc9_hours 별도 카운트
-      - 시간별 시계열 → 일별 합산 (YYYY-MM-DD)
-      - 반환값 date 키는 모두 0시 자정 기준 (UTC 00:00)
+    핵심:
+      - 시간별 강수량 유지 (절대 일별 집계 금지)
+      - 결측(NaN)은 0mm 처리
+      - QC플래그 = 9 → 0mm (결측 표지)
+      - DatetimeIndex로 시간 정렬 보장
     """
     csv_path = Path(csv_path)
     if not csv_path.exists():
         raise FileNotFoundError(f"ASOS CSV not found: {csv_path}")
 
-    # cp949로 읽기 (utf-8 사용 시 한글 깨짐)
-    df = pd.read_csv(csv_path, encoding="cp949", dtype={"지점": str})
+    # cp949로 읽기
+    df = pd.read_csv(csv_path, encoding="cp949", dtype={"지점": str}, low_memory=False)
 
     # 필수 칼럼 확인
     required = {"지점", "일시", "강수량(mm)"}
     if not required.issubset(df.columns):
         raise ValueError(f"Missing columns in {csv_path.name}. Need: {required}")
-
-    # NaN 처리: 모든 비어있는 강수량 = 0mm
-    df["강수량(mm)"] = df["강수량(mm)"].fillna(0.0)
-
-    # QC플래그 처리
-    if "강수량QC플래그" in df.columns:
-        df["강수량QC플래그"] = df["강수량QC플래그"].fillna(0).astype(int)
-        qc9_mask = df["강수량QC플래그"] == 9
-        df.loc[qc9_mask, "강수량(mm)"] = 0.0  # 결측 → 0mm
-    else:
-        qc9_mask = pd.Series(False, index=df.index)
 
     # 일시 파싱 (YYYY-MM-DD HH:MM 형식)
     try:
@@ -79,7 +68,74 @@ def load_asos_daily_precip(
     except Exception as e:
         raise ValueError(f"Failed to parse '일시' column in {csv_path.name}: {e}")
 
-    # 날짜 추출 (YYYY-MM-DD)
+    # 강수량 처리: 결측과 무강수 구별
+    # - NaN (실제 결측) → 0mm
+    # - QC=9 (결측 표지) → 0mm
+    # - 0.0 (측정된 무강수) → 0.0 유지
+    df["강수량(mm)"] = df["강수량(mm)"].fillna(0.0)
+
+    # QC플래그 확인: 결측(QC=9) 마킹
+    if "강수량QC플래그" in df.columns:
+        df["강수량QC플래그"] = df["강수량QC플래그"].fillna(0).astype(int)
+        qc9_mask = df["강수량QC플래그"] == 9
+        df.loc[qc9_mask, "강수량(mm)"] = 0.0
+
+    # 지점별 시간 시계열
+    result: dict[str, pd.Series] = {}
+
+    for station_code, group in df.groupby("지점", sort=False):
+        # datetime으로 정렬 후 Series 구성
+        group = group.sort_values("datetime").reset_index(drop=True)
+        series = pd.Series(
+            group["강수량(mm)"].astype(float).values,
+            index=pd.DatetimeIndex(group["datetime"]),
+            name=f"rain_{station_code}",
+        )
+        result[station_code] = series
+
+    return result
+
+
+def load_asos_daily_precip(
+    csv_path: Path | str, year: int | None = None
+) -> dict[str, dict[date, float]]:
+    """
+    ASOS 시간별 CSV → 지점별 일일강수량 테이블 (후방성 호환성).
+
+    주의: 이 함수는 시간 정보를 손실합니다.
+    HSU 모델용으로는 load_asos_hourly_precip을 사용하세요.
+
+    Returns:
+        {station_code: {date: mm, ...}, ...}
+    """
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"ASOS CSV not found: {csv_path}")
+
+    # cp949로 읽기
+    df = pd.read_csv(csv_path, encoding="cp949", dtype={"지점": str}, low_memory=False)
+
+    # 필수 칼럼 확인
+    required = {"지점", "일시", "강수량(mm)"}
+    if not required.issubset(df.columns):
+        raise ValueError(f"Missing columns in {csv_path.name}. Need: {required}")
+
+    # 일시 파싱
+    try:
+        df["datetime"] = pd.to_datetime(df["일시"], format="%Y-%m-%d %H:%M")
+    except Exception as e:
+        raise ValueError(f"Failed to parse '일시' column in {csv_path.name}: {e}")
+
+    # 강수량 처리
+    df["강수량(mm)"] = df["강수량(mm)"].fillna(0.0)
+
+    # QC플래그 처리
+    if "강수량QC플래그" in df.columns:
+        df["강수량QC플래그"] = df["강수량QC플래그"].fillna(0).astype(int)
+        qc9_mask = df["강수량QC플래그"] == 9
+        df.loc[qc9_mask, "강수량(mm)"] = 0.0
+
+    # 날짜 추출
     df["date"] = df["datetime"].dt.date
 
     # 지점별 일별 합산
@@ -87,15 +143,10 @@ def load_asos_daily_precip(
 
     for station_code, group in df.groupby("지점", sort=False):
         daily_precip: dict[date, float] = {}
-        qc9_count: dict[date, int] = {}
 
         for d, day_group in group.groupby("date"):
             mm_sum = day_group["강수량(mm)"].sum()
-            qc9_count_day = (day_group.index.isin(df.index[qc9_mask])).sum()
-
             daily_precip[d] = round(float(mm_sum), 1)
-            if qc9_count_day > 0:
-                qc9_count[d] = qc9_count_day
 
         result[station_code] = daily_precip
 
@@ -116,19 +167,19 @@ def list_asos_files(data_dir: Path | str | None = None) -> list[Path]:
 
 def load_asos_range(
     start_year: int, end_year: int, data_dir: Path | str | None = None
-) -> dict[str, dict[date, float]]:
+) -> dict[str, pd.Series]:
     """
-    여러 년도의 ASOS 데이터를 로드 & 병합.
+    여러 년도의 ASOS 시간별 데이터를 로드 & 병합.
 
     Args:
         start_year, end_year: 포함 범위 (예: 2023, 2025)
         data_dir: ASOS 파일 디렉토리
 
     Returns:
-        {station_code: {date: mm, ...}, ...} (모든 년도 병합)
+        {station_code: pd.Series(hourly, datetime_index), ...} (모든 년도 병합)
     """
     files = list_asos_files(data_dir)
-    combined: dict[str, dict[date, float]] = {}
+    combined: dict[str, list] = {}  # {station_code: [series, series, ...]}
 
     for fpath in files:
         # 파일명에서 연도 추출 (OBS_ASOS_TIM_YYYY_all.csv)
@@ -139,13 +190,26 @@ def load_asos_range(
         if not (start_year <= year <= end_year):
             continue
 
-        station_data = load_asos_daily_precip(fpath, year)
-        for station_code, daily_dict in station_data.items():
-            if station_code not in combined:
-                combined[station_code] = {}
-            combined[station_code].update(daily_dict)
+        try:
+            station_data = load_asos_hourly_precip(fpath, year)
+            for station_code, hourly_series in station_data.items():
+                if station_code not in combined:
+                    combined[station_code] = []
+                combined[station_code].append(hourly_series)
+        except Exception as e:
+            print(f"⚠️  {fpath.name} 처리 실패: {e}")
+            continue
 
-    return combined
+    # 시계열 병합 (년도별 Series를 시간순 정렬 & concat)
+    result: dict[str, pd.Series] = {}
+    for station_code, series_list in combined.items():
+        if not series_list:
+            continue
+        # 모든 년도 데이터를 시간순으로 정렬 후 concat
+        merged = pd.concat(series_list, axis=0).sort_index()
+        result[station_code] = merged
+
+    return result
 
 
 def assign_nearest_station(lat: float, lon: float, exclude_codes: list[str] | None = None) -> tuple[str, float]:
@@ -179,6 +243,29 @@ def assign_nearest_station(lat: float, lon: float, exclude_codes: list[str] | No
     return nearest_code, min_distance
 
 
+def get_region_hourly_precip(
+    station_data: dict[str, pd.Series],
+    lat: float,
+    lon: float,
+    exclude_codes: list[str] | None = None,
+) -> pd.Series:
+    """
+    지역(위경도)에 할당된 ASOS 지점의 시간별 강수량.
+
+    Args:
+        station_data: load_asos_range() 결과 (시간별 Series)
+        lat, lon: 지역 또는 발전소 좌표
+        exclude_codes: 제외할 지점코드
+
+    Returns:
+        pd.Series(hourly, datetime_index)
+    """
+    nearest_code, dist = assign_nearest_station(lat, lon, exclude_codes)
+    hourly_precip = station_data.get(nearest_code, pd.Series(dtype=float))
+
+    return hourly_precip
+
+
 def get_region_daily_precip(
     station_data: dict[str, dict[date, float]],
     lat: float,
@@ -186,12 +273,10 @@ def get_region_daily_precip(
     exclude_codes: list[str] | None = None,
 ) -> dict[date, float]:
     """
-    지역(위경도)에 할당된 ASOS 지점의 강수량.
+    지역(위경도)에 할당된 ASOS 지점의 일별 강수량 (후방성 호환성).
 
-    Args:
-        station_data: load_asos_range() 결과
-        lat, lon: 지역 또는 발전소 좌표
-        exclude_codes: 제외할 지점코드
+    주의: 이 함수는 시간 정보를 사용하지 않습니다.
+    HSU 모델용으로는 get_region_hourly_precip을 사용하세요.
 
     Returns:
         {date: mm, ...}

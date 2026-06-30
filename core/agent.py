@@ -20,6 +20,7 @@ from typing import Any
 import os
 
 from .airkorea_pm import daily_pm_average, demo_pm_observations, normalize_sido
+from .asos_rainfall import get_region_daily_precip, get_region_hourly_precip, load_asos_range
 from .kma_weather import daily_rainfall_mm, fetch_kma_surface
 from .lcoe import DEFAULT_INPUTS, LcoeInputs, calculate_lcoe
 from .pm_statistics import list_pm_stat_files, load_daily_pm_statistics, pm_stats_dir
@@ -48,6 +49,7 @@ class AgentRequest:
     lookback_days: int = 365
     use_live_data: bool = False
     live_weather_days_limit: int = 10
+    use_asos_rainfall: bool = True  # ASOS 실측 강수 사용 여부 (기본값: True)
     pm_stats_dir: str | None = None
     top_n: int = 5
     lcoe_inputs: LcoeInputs = field(default_factory=lambda: replace(DEFAULT_INPUTS))
@@ -161,16 +163,71 @@ def _demo_rainfall(start: date, end: date, seed_text: str) -> dict[date, float]:
     return rainfall
 
 
-def _collect_rainfall(site: Site, start: date, end: date, req: AgentRequest) -> tuple[dict[date, float], list[str]]:
-    rainfall = _demo_rainfall(start, end, site.name)
-    notes = ["기상 데이터: 기본 데모 강수 시계열을 생성했습니다."]
+def _collect_rainfall(site: Site, start: date, end: date, req: AgentRequest):
+    """
+    강수량 수집: ASOS 실측(시간 단위) → 데모 시뮬레이션 → KMA API (최근 N일).
 
+    우선순위:
+      1. use_asos_rainfall=True → ASOS 시간 강수(권장)
+      2. 아니면 → 데모 강수 시계열(일 단위)
+      3. use_live_data=True → KMA API로 최근 N일 덮어씀(일 단위)
+
+    Returns:
+        (rainfall_input, notes) where:
+          rainfall_input: pd.Series(hourly, DatetimeIndex) if ASOS
+                         or dict[date, float] if demo/KMA
+          notes: list[str]
+    """
+    import pandas as pd
+
+    rainfall_input = None
+    notes: list[str] = []
+
+    # Step 1: ASOS 실측 강수 시도 (시간 단위)
+    if req.use_asos_rainfall:
+        try:
+            asos_data_hourly = load_asos_range(start.year, end.year)
+            if asos_data_hourly and site.lat and site.lon:
+                asos_rainfall_hourly = get_region_hourly_precip(asos_data_hourly, site.lat, site.lon)
+                # 분석 기간 내의 ASOS 데이터만 사용
+                if len(asos_rainfall_hourly) > 0:
+                    mask = (asos_rainfall_hourly.index.date >= start) & (asos_rainfall_hourly.index.date <= end)
+                    rainfall_input = asos_rainfall_hourly[mask]
+                    if len(rainfall_input) > 0:
+                        rainy_hours = (rainfall_input > 0.0).sum()
+                        notes.append(
+                            f"ASOS 시간 강수(실측값)을 {start} ~ {end} 구간에 적용했습니다 "
+                            f"({len(rainfall_input)}시간, {rainy_hours}시간 강우)."
+                        )
+                    else:
+                        rainfall_input = None
+                        notes.append("ASOS 데이터를 로드했으나 분석 기간에 데이터가 없습니다.")
+                else:
+                    notes.append("ASOS 데이터를 로드했으나 지역에 매칭되는 지점이 없습니다.")
+        except Exception as exc:
+            notes.append(f"ASOS 실측값 로드 실패: {exc}")
+
+    # Step 2: 데모 강수 (ASOS 없거나 실패 시 보충) - 일 단위
+    if rainfall_input is None:
+        rainfall_input = _demo_rainfall(start, end, site.name)
+        notes.append("기상 데이터: 기본 데모 강수 시계열을 생성했습니다 (일별).")
+
+    # Step 3: KMA API로 최근 N일 덮어씀 (선택사항) - 일 단위만 가능
     if not req.use_live_data:
-        return rainfall, notes
+        return rainfall_input, notes
 
     if not os.environ.get("KMA_API_KEY"):
-        notes.append("KMA_API_KEY가 없어 기상청 실조회 대신 데모 강수 데이터를 사용했습니다.")
-        return rainfall, notes
+        notes.append("KMA_API_KEY가 없어 기상청 실조회를 건너뜁니다.")
+        return rainfall_input, notes
+
+    # rainfall_input이 Series면 일별로 변환 후 KMA와 병합
+    if isinstance(rainfall_input, pd.Series):
+        rainfall_dict = rainfall_input.resample("D").sum().to_dict()
+        rainfall_dict = {d: v for d, v in rainfall_dict.items() if isinstance(d, date) or hasattr(d, 'date')}
+        # Timestamp → date 변환
+        rainfall_dict = {d.date() if hasattr(d, 'date') else d: v for d, v in rainfall_dict.items()}
+    else:
+        rainfall_dict = rainfall_input.copy()
 
     live_days = max(1, min(req.live_weather_days_limit, (end - start).days + 1))
     live_start = end - timedelta(days=live_days - 1)
@@ -183,13 +240,15 @@ def _collect_rainfall(site: Site, start: date, end: date, req: AgentRequest) -> 
             sleep_sec=0.15,
         )
         live_rain = daily_rainfall_mm(rows)
-        rainfall.update({d: float(v) for d, v in live_rain.items() if start <= d <= end})
+        rainfall_dict.update({d: float(v) for d, v in live_rain.items() if start <= d <= end})
         notes.append(
             f"기상청 KMA 지상관측을 최근 {live_days}일 구간에 반영했습니다."
         )
+        rainfall_input = rainfall_dict  # KMA 적용 후 일별로 반환
     except Exception as exc:
-        notes.append(f"기상청 실조회 실패로 데모 강수 데이터를 유지했습니다: {exc}")
-    return rainfall, notes
+        notes.append(f"기상청 실조회 실패: {exc}")
+
+    return rainfall_input, notes
 
 
 def _region_pair_from_request(site: Site, req: AgentRequest) -> tuple[str, str]:
@@ -258,6 +317,8 @@ def run_cleaning_agent(req: AgentRequest) -> AgentResult:
         capacity_kw=lcoe_base_inputs.capacity,
         util_rate_pct=lcoe_base_inputs.util_rate,
         top_n=req.top_n,
+        regional_weight_ppt=0.0,
+        model_name="hsu",  # HSU 모델만 사용 (근거 있는 IEEE 논문 기반)
     )
 
     lcoe_inputs = replace(

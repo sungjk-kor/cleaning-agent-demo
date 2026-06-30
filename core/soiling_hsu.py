@@ -49,7 +49,7 @@ class HsuSoilingResult:
 
 
 def run_hsu_model(
-    rainfall_by_date: Mapping[date, float],
+    rainfall_input,  # pd.Series(hourly, DatetimeIndex) 또는 {date: mm}
     pm_by_date: Mapping[date, dict],
     start: date,
     end: date,
@@ -58,7 +58,7 @@ def run_hsu_model(
     HSU 소일링 모델 실행.
 
     Args:
-        rainfall_by_date: {date: mm, ...}
+        rainfall_input: pd.Series(hourly, DatetimeIndex) 권장 | {date: mm} 후방성호환
         pm_by_date: {date: {"pm10": µg/m³, "pm25": µg/m³}, ...}
         start, end: 분석 기간
 
@@ -66,23 +66,31 @@ def run_hsu_model(
         HsuSoilingResult with daily soiling, annual stats, assumptions.
 
     주의사항:
+      - 강수는 반드시 시간 단위 Series 권장 (일별 입력 시 시간 정보 손실)
       - PM 단위: µg/m³ → g/m³ (×1e-6) 반드시 수행
-      - rainfall은 DatetimeIndex Series 필요 (내부에서 rolling 사용)
       - pm10은 "전체값" (coarse = pm10-pm25는 pvlib이 처리)
-      - 비어있는 강수: 0mm, 비어있는 PM: 날씨 기본값 사용 (아래)
+      - 결측 PM: 기본값 사용
     """
-    # Step 1: 시계열 데이터 구성 (hourly)
-    date_range = pd.date_range(start=start, end=end, freq="D")
-    rainfall_series = []
+    # Step 1: 강수 시계열 준비 (시간 or 일 단위)
+    if isinstance(rainfall_input, pd.Series):
+        # ✓ 시간 단위 Series 입력 (권장)
+        rain = rainfall_input.astype(float).fillna(0.0)
+    else:
+        # 후방성호환: {date: mm} 형태 → 일별로만 데이터 존재 (시간 정보 손실)
+        date_range = pd.date_range(start=start, end=end, freq="D")
+        rainfall_series = []
+        for d in date_range:
+            rain_mm = float(rainfall_input.get(d, 0.0) or 0.0)
+            rainfall_series.append(rain_mm)
+        rain = pd.Series(rainfall_series, index=date_range, dtype=float)
+
+    # Step 2: PM 시계열 준비 (일별 → 시간별 업샘플링)
+    date_range_daily = pd.date_range(start=start, end=end, freq="D")
     pm25_series = []
     pm10_series = []
 
-    for d in date_range:
-        # 강수: 없으면 0mm
-        rain_mm = float(rainfall_by_date.get(d, 0.0) or 0.0)
-        rainfall_series.append(rain_mm)
-
-        # PM: 없으면 기본값 (기존 model과 동일)
+    for d in date_range_daily:
+        # PM: 없으면 기본값
         pm_dict = pm_by_date.get(d, {})
         pm25_ugm3 = float(pm_dict.get("pm25", 18.0))  # 기본값 18 µg/m³
         pm10_ugm3 = float(pm_dict.get("pm10", 35.0))  # 기본값 35 µg/m³
@@ -90,22 +98,19 @@ def run_hsu_model(
         pm25_series.append(pm25_ugm3)
         pm10_series.append(pm10_ugm3)
 
-    # DataFrame 구성 (DatetimeIndex 필수)
-    df = pd.DataFrame(
-        {
-            "rainfall_mm": rainfall_series,
-            "pm25_ugm3": pm25_series,
-            "pm10_ugm3": pm10_series,
-        },
-        index=date_range,
-    )
+    # Step 3: PM을 일별 Series로 생성
+    pm25_daily = pd.Series(pm25_series, index=date_range_daily, dtype=float) * 1e-6  # µg/m³ → g/m³
+    pm10_daily = pd.Series(pm10_series, index=date_range_daily, dtype=float) * 1e-6  # µg/m³ → g/m³
 
-    # Step 2: 단위 변환 (µg/m³ → g/m³)
-    rain = df["rainfall_mm"].astype(float).fillna(0.0)
-    pm25 = df["pm25_ugm3"].astype(float) * 1e-6  # µg/m³ → g/m³
-    pm10 = df["pm10_ugm3"].astype(float) * 1e-6  # µg/m³ → g/m³ (전체값)
+    # Step 4: PM을 시간 단위로 업샘플링 (일일 값을 24시간 동일하게 유지)
+    pm25 = pm25_daily.asfreq("h", method="ffill")  # 매 시간 같은 값 반복
+    pm10 = pm10_daily.asfreq("h", method="ffill")
 
-    # Step 3: HSU 모델 실행
+    # 강수와 동일한 시간 범위로 정렬
+    pm25 = pm25.reindex(rain.index, method="ffill")
+    pm10 = pm10.reindex(rain.index, method="ffill")
+
+    # Step 5: HSU 모델 실행 (모든 입력이 시간 단위 Series)
     try:
         soiling_ratio = soiling.hsu(
             rain,
@@ -119,11 +124,11 @@ def run_hsu_model(
     except Exception as e:
         raise ValueError(f"HSU model failed: {e}")
 
-    # Step 4: 손실률 계산 및 일별 집계
+    # Step 6: 손실률 계산 및 일별 집계
     loss_pct = (1 - soiling_ratio) * 100  # 소일링 손실 %
     daily_loss = loss_pct.resample("D").mean()  # 일별 평균
 
-    # Step 5: 통계 계산
+    # Step 7: 통계 계산
     annual_loss = daily_loss.mean()
     peak_loss = daily_loss.max()
     p95_loss = daily_loss.quantile(0.95)

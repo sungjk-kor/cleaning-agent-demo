@@ -22,6 +22,7 @@ from .agent import (
 )
 from .lcoe import DEFAULT_INPUTS, LcoeResult, calculate_lcoe
 from .pollution_model import PollutionModelResult, simulate_cleaning_decision
+from .soiling_weights import calc_regional_weight
 
 
 TOOLS: list[dict] = [
@@ -134,6 +135,82 @@ TOOLS: list[dict] = [
             "required": ["pollution_loss_pct"],
         },
     },
+    {
+        "name": "evaluate_regional_characteristics",
+        "description": (
+            "지역 특성(농업지역, 산업, 해안 등)을 종합하여 "
+            "소일링 손실 가중치를 계산합니다. "
+            "사용자가 R1~R5를 선택하고, AI가 R6(황사/고농도)·R7(강수세척)을 판정합니다. "
+            "수집된 PM·강수 데이터를 기반으로 강도를 판정하세요."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "r1_agricultural": {
+                    "type": "boolean",
+                    "description": "농업지역 (낮음/중간/높음)",
+                },
+                "r1_level": {
+                    "type": "string",
+                    "enum": ["low", "mid", "high"],
+                    "description": "R1 강도 (r1_agricultural=true일 때만)",
+                },
+                "r2_industrial": {
+                    "type": "boolean",
+                    "description": "산업/건설 인접 (낮음/중간/높음)",
+                },
+                "r2_level": {
+                    "type": "string",
+                    "enum": ["low", "mid", "high"],
+                    "description": "R2 강도 (r2_industrial=true일 때만)",
+                },
+                "r3_traffic": {
+                    "type": "boolean",
+                    "description": "철도/주요도로 인접 (낮음/중간/높음)",
+                },
+                "r3_level": {
+                    "type": "string",
+                    "enum": ["low", "mid", "high"],
+                    "description": "R3 강도 (r3_traffic=true일 때만)",
+                },
+                "r4_coastal": {
+                    "type": "boolean",
+                    "description": "해안 인접 (낮음/중간/높음)",
+                },
+                "r4_level": {
+                    "type": "string",
+                    "enum": ["low", "mid", "high"],
+                    "description": "R4 강도 (r4_coastal=true일 때만)",
+                },
+                "r5_tilt": {
+                    "type": "boolean",
+                    "description": "저틸트/하단 집중 (낮음/중간/높음)",
+                },
+                "r5_level": {
+                    "type": "string",
+                    "enum": ["low", "mid", "high"],
+                    "description": "R5 강도 (r5_tilt=true일 때만)",
+                },
+                "r6_dust_level": {
+                    "type": "string",
+                    "enum": ["low", "mid", "high"],
+                    "description": (
+                        "R6 봄철 황사/고농도 강도 (AI가 PM 데이터를 보고 판정). "
+                        "PM10 45+ → high, 35-45 → mid, <35 → low"
+                    ),
+                },
+                "r7_rainfall_level": {
+                    "type": "string",
+                    "enum": ["low", "mid", "high"],
+                    "description": (
+                        "R7 강수 자연세척 강도 (AI가 강수 데이터를 보고 판정, 감산). "
+                        "강수 충분(월평균 100mm+) → high, 보통(50-100mm) → mid, 부족(<50mm) → low"
+                    ),
+                },
+            },
+            "required": ["r6_dust_level", "r7_rainfall_level"],
+        },
+    },
 ]
 
 _SYSTEM_PROMPT = """당신은 태양광 발전소 패널 세척 판단 전문 에이전트입니다.
@@ -142,8 +219,9 @@ _SYSTEM_PROMPT = """당신은 태양광 발전소 패널 세척 판단 전문 �
 1. resolve_site: 지역 사이트 확정
 2. get_rainfall: 강수량 데이터 수집
 3. get_pm: 미세먼지 데이터 수집
-4. run_pollution_model: 오염 모델 실행 및 세척 우선순위 계산
-5. run_lcoe: LCOE 영향 분석
+4. evaluate_regional_characteristics: 지역특성 평가 (R1~R5는 사용자 입력값, R6~R7은 PM·강수 데이터로 판정)
+5. run_pollution_model: 오염 모델 실행 및 세척 우선순위 계산 (지역특성 가중치 반영)
+6. run_lcoe: LCOE 영향 분석
 
 모든 도구 호출이 완료되면 분석 결과를 한국어 마크다운 리포트로 요약하세요.
 각 단계의 결과를 바탕으로 구체적인 세척 권고안을 제시하세요."""
@@ -158,6 +236,7 @@ class LLMAgentResult:
     end_date: date | None = None
     pollution: PollutionModelResult | None = None
     lcoe: Any = None
+    regional_weight: Any = None  # RegionalWeightResult
     data_notes: list[str] = field(default_factory=list)
 
 
@@ -194,6 +273,7 @@ def run_llm_agent(
     top_n: int = 5,
     model: str = "claude-sonnet-4-6",
     pm_stats_dir: str | None = None,
+    regional_characteristics: dict | None = None,
 ) -> LLMAgentResult:
     """LLM tool-use 에이전트를 실행하여 세척 판단 리포트를 생성합니다."""
 
@@ -212,11 +292,13 @@ def run_llm_agent(
         "pm_by_date": None,
         "pollution": None,
         "lcoe": None,
+        "regional_weight": None,
         "data_notes": [],
         "capacity_kw": capacity_kw,
         "util_rate_pct": DEFAULT_INPUTS.util_rate,
         "top_n": top_n,
         "pm_stats_dir": pm_stats_dir,
+        "regional_characteristics": regional_characteristics or {},
     }
 
     trace: list[dict] = []
@@ -305,6 +387,11 @@ def run_llm_agent(
         state["util_rate_pct"] = util
         state["top_n"] = n
 
+        # 지역특성 가중치 적용 (있으면 사용, 없으면 0.0)
+        regional_weight_ppt = 0.0
+        if state.get("regional_weight") is not None:
+            regional_weight_ppt = state["regional_weight"].total_ppt
+
         pollution = simulate_cleaning_decision(
             rainfall_by_date=state["rainfall_by_date"],
             pm_by_date=state["pm_by_date"],
@@ -313,6 +400,7 @@ def run_llm_agent(
             capacity_kw=cap,
             util_rate_pct=util,
             top_n=n,
+            regional_weight_ppt=regional_weight_ppt,
         )
         state["pollution"] = pollution
 
@@ -322,10 +410,15 @@ def run_llm_agent(
             f"7일 손실 {p.expected_7d_loss_kwh:,.0f}kWh) — {p.reason}"
             for p in pollution.priorities
         ]
+
+        regional_note = ""
+        if regional_weight_ppt > 0.001:
+            regional_note = f"\n- 지역특성 가중치: +{regional_weight_ppt:.3f}%p (PM 손실 {pollution.annual_pm_loss_pct:.3f}% + 지역특성)"
+
         return (
             f"오염 모델 실행 완료:\n"
             f"- 연평균 오염 손실률: {pollution.annual_pollution_loss_pct:.2f}%\n"
-            f"- 연간 발전량 감소 추정: {pollution.annual_generation_loss_kwh:,.0f} kWh\n"
+            f"- 연간 발전량 감소 추정: {pollution.annual_generation_loss_kwh:,.0f} kWh{regional_note}\n"
             f"- 세척 우선순위 Top {n}:\n" + "\n".join(priority_lines)
         )
 
@@ -353,12 +446,68 @@ def run_llm_agent(
             f"- 발전량 감소율: {lcoe_result.gen_decrease:.2f}%"
         )
 
+    def _exec_evaluate_regional_characteristics(inp: dict) -> str:
+        applied = {}
+
+        # R1~R5: 사용자 입력값 (state에서 가져오기)
+        user_chars = state.get("regional_characteristics", {})
+        if user_chars.get("r1_agricultural"):
+            level = user_chars.get("r1_level", "low")
+            if level in ("low", "mid", "high"):
+                applied["R1"] = level
+
+        if user_chars.get("r2_industrial"):
+            level = user_chars.get("r2_level", "low")
+            if level in ("low", "mid", "high"):
+                applied["R2"] = level
+
+        if user_chars.get("r3_traffic"):
+            level = user_chars.get("r3_level", "low")
+            if level in ("low", "mid", "high"):
+                applied["R3"] = level
+
+        if user_chars.get("r4_coastal"):
+            level = user_chars.get("r4_level", "low")
+            if level in ("low", "mid", "high"):
+                applied["R4"] = level
+
+        if user_chars.get("r5_tilt"):
+            level = user_chars.get("r5_level", "low")
+            if level in ("low", "mid", "high"):
+                applied["R5"] = level
+
+        # R6~R7: AI 판정값 (LLM이 PM·강수 데이터를 보고 판정)
+        r6_level = inp.get("r6_dust_level", "low")
+        if r6_level in ("low", "mid", "high"):
+            applied["R6"] = r6_level
+
+        r7_level = inp.get("r7_rainfall_level", "low")
+        if r7_level in ("low", "mid", "high"):
+            applied["R7"] = r7_level
+
+        result = calc_regional_weight(applied)
+        state["regional_weight"] = result
+
+        breakdown_lines = [
+            f"  {item.rule_id} {item.name}: {item.level} → {item.value_ppt:+.2f}%p"
+            for item in result.breakdown
+        ]
+
+        return (
+            f"지역특성 평가 완료:\n"
+            f"- 최종 가중치: {result.total_ppt:+.3f}%p\n"
+            f"- 가산 상한 적용: {'예' if result.capped else '아니오'}\n"
+            f"- 규칙별:\n" + "\n".join(breakdown_lines) + "\n"
+            f"- {result.note}"
+        )
+
     _executors = {
         "resolve_site": _exec_resolve_site,
         "get_rainfall": _exec_get_rainfall,
         "get_pm": _exec_get_pm,
         "run_pollution_model": _exec_run_pollution_model,
         "run_lcoe": _exec_run_lcoe,
+        "evaluate_regional_characteristics": _exec_evaluate_regional_characteristics,
     }
 
     # Build initial user message
@@ -469,5 +618,6 @@ def run_llm_agent(
         end_date=state["end_date"],
         pollution=state["pollution"],
         lcoe=state["lcoe"],
+        regional_weight=state.get("regional_weight"),
         data_notes=list(state["data_notes"]),
     )

@@ -216,6 +216,63 @@ with st.sidebar:
 
     lcoe_inputs = _build_lcoe_inputs()
 
+    # 지역특성 입력 (R1~R5: 사용자 입력, R6~R7: AI 판정)
+    regional_characteristics = {}
+    with st.sidebar.expander("🌍 지역특성 (선택)", expanded=False):
+        st.caption("다음 조건이 해당되면 체크하세요. 강도는 저/중/고 중 선택.")
+
+        col1, col2 = st.columns([1.5, 1])
+        with col1:
+            r1_agr = st.checkbox("농업지역", value=False, key="r1_agr")
+        if r1_agr:
+            with col2:
+                regional_characteristics["r1_agricultural"] = True
+                regional_characteristics["r1_level"] = st.selectbox("강도", ["low", "mid", "high"], format_func=lambda x: {"low":"저", "mid":"중", "high":"고"}[x], key="r1_level")
+        else:
+            regional_characteristics["r1_agricultural"] = False
+
+        col1, col2 = st.columns([1.5, 1])
+        with col1:
+            r2_ind = st.checkbox("산업/건설 인접", value=False, key="r2_ind")
+        if r2_ind:
+            with col2:
+                regional_characteristics["r2_industrial"] = True
+                regional_characteristics["r2_level"] = st.selectbox("강도", ["low", "mid", "high"], format_func=lambda x: {"low":"저", "mid":"중", "high":"고"}[x], key="r2_level")
+        else:
+            regional_characteristics["r2_industrial"] = False
+
+        col1, col2 = st.columns([1.5, 1])
+        with col1:
+            r3_tra = st.checkbox("철도/주요도로 인접", value=False, key="r3_tra")
+        if r3_tra:
+            with col2:
+                regional_characteristics["r3_traffic"] = True
+                regional_characteristics["r3_level"] = st.selectbox("강도", ["low", "mid", "high"], format_func=lambda x: {"low":"저", "mid":"중", "high":"고"}[x], key="r3_level")
+        else:
+            regional_characteristics["r3_traffic"] = False
+
+        col1, col2 = st.columns([1.5, 1])
+        with col1:
+            r4_cos = st.checkbox("해안 인접", value=False, key="r4_cos")
+        if r4_cos:
+            with col2:
+                regional_characteristics["r4_coastal"] = True
+                regional_characteristics["r4_level"] = st.selectbox("강도", ["low", "mid", "high"], format_func=lambda x: {"low":"저", "mid":"중", "high":"고"}[x], key="r4_level")
+        else:
+            regional_characteristics["r4_coastal"] = False
+
+        col1, col2 = st.columns([1.5, 1])
+        with col1:
+            r5_tilt = st.checkbox("저틸트/하단 집중", value=False, key="r5_tilt")
+        if r5_tilt:
+            with col2:
+                regional_characteristics["r5_tilt"] = True
+                regional_characteristics["r5_level"] = st.selectbox("강도", ["low", "mid", "high"], format_func=lambda x: {"low":"저", "mid":"중", "high":"고"}[x], key="r5_level")
+        else:
+            regional_characteristics["r5_tilt"] = False
+
+        st.caption("※ R6(봄철 황사), R7(강수세척)은 AI가 PM·강수 데이터를 보고 판정합니다.")
+
     st.divider()
     agent_mode = st.toggle(
         "에이전트 모드 (LLM)",
@@ -265,6 +322,7 @@ if "last_result" not in st.session_state or run:
                 lookback_years=lookback_years,
                 capacity_kw=lcoe_inputs.capacity,
                 top_n=top_n,
+                regional_characteristics=regional_characteristics,
             )
         st.session_state["last_agent_mode"] = True
     else:
@@ -300,6 +358,39 @@ if result.pollution is not None and result.lcoe is not None and result.site is n
     metric_cols[1].metric("연간 발전량 손실", f"{result.pollution.annual_generation_loss_kwh:,.0f} kWh")
     metric_cols[2].metric("반영 후 LCOE", f"{result.lcoe.ref_lcoe:.2f} 원/kWh", f"+{result.lcoe.lcoe_increase:.2f}%")
     metric_cols[3].metric("분석 지점", result.site.name)
+
+    # HSU 모델 산출식 및 출처
+    with st.expander("📐 HSU 모델 산출식 및 출처", expanded=False):
+        st.markdown("""
+### HSU 소일링 모델 (Coello & Boyle 2019)
+
+**기본 원리:**
+```
+소일링 손실(%) = (1 - SR) × 100
+여기서 SR = soiling_ratio (0~1, 1=완전 세척)
+```
+
+**침적 계산:**
+- PM2.5 침적 속도: 0.0009 m/s
+- PM10 침적 속도: 0.004 m/s
+- 일일 누적 침적량 계산
+
+**자연 세척:**
+- 강우 임계값: 0.5mm 이상 시 자동 세척
+- 일시간 단위 강우 누적으로 판정
+
+**적용 파라미터:**
+- 경사각: 30° (한국 고정설치 표준)
+- PM 단위: AirKorea µg/m³ → pvlib g/m³ (×1e-6)
+- 강수: ASOS 관측 일강수량(mm)
+
+**출처:**
+- Coello, C., & Boyle, L. (2019).
+- "Performance of soiled photovoltaic modules"
+- IEEE Journal of Photovoltaics, 9(5), 1382-1387
+- DOI: 10.1109/JPHOTOV.2019.2914786
+- Implementation: pvlib-python soiling.hsu()
+        """)
 
     left, right = st.columns([1.2, 0.8], gap="large")
     with left:
@@ -342,6 +433,28 @@ if result.pollution is not None and result.lcoe is not None and result.site is n
     with st.expander("모델 가정"):
         for item in result.pollution.assumptions:
             st.write(f"- {item}")
+
+    # 에이전트 모드이고 지역특성 결과가 있으면 표시
+    if is_agent_result and result.regional_weight is not None:
+        with st.expander("🌍 지역특성 분석"):
+            st.markdown(f"**최종 가중치: {result.regional_weight.total_ppt:+.3f}%p**")
+            st.markdown(f"가산 상한 적용: {'예' if result.regional_weight.capped else '아니오'}")
+
+            # Breakdown 테이블
+            breakdown_data = []
+            for item in result.regional_weight.breakdown:
+                breakdown_data.append({
+                    "규칙": item.rule_id,
+                    "이름": item.name,
+                    "강도": {"low": "저", "mid": "중", "high": "고"}.get(item.level, item.level),
+                    "가중값(%p)": f"{item.value_ppt:+.2f}",
+                    "출처": item.source,
+                })
+            if breakdown_data:
+                breakdown_df = pd.DataFrame(breakdown_data)
+                st.dataframe(breakdown_df, use_container_width=True, hide_index=True)
+
+            st.caption(result.regional_weight.note)
 
 else:
     if is_agent_result:

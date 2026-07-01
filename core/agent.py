@@ -50,6 +50,7 @@ class AgentRequest:
     use_live_data: bool = False
     live_weather_days_limit: int = 10
     use_asos_rainfall: bool = True  # ASOS 실측 강수 사용 여부 (기본값: True)
+    f_site: float = 1.0  # 지역특성 계수 (1.0=일반, 산업/건조는 배수)
     pm_stats_dir: str | None = None
     top_n: int = 5
     lcoe_inputs: LcoeInputs = field(default_factory=lambda: replace(DEFAULT_INPUTS))
@@ -317,8 +318,8 @@ def run_cleaning_agent(req: AgentRequest) -> AgentResult:
         capacity_kw=lcoe_base_inputs.capacity,
         util_rate_pct=lcoe_base_inputs.util_rate,
         top_n=req.top_n,
-        regional_weight_ppt=0.0,
-        model_name="hsu",  # HSU 모델만 사용 (근거 있는 IEEE 논문 기반)
+        model_name="semiphysical",  # 반물리 5단계 모델 (IEA 보고서 기반)
+        f_site=req.f_site,
     )
 
     lcoe_inputs = replace(

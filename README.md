@@ -65,29 +65,34 @@ This transparency is the point. An agent you can't inspect can't be a trustworth
 
 ## The soiling model — where domain knowledge meets the agent
 
-Soiling is modeled as a two-term additive structure:
+Soiling is estimated with a **semi-physical 5-stage model**, grounded in **IEA PVPS Task 13 (T13-21:2022)** and the Coello–Boyle deposition framework — not a "PM × dry-days" guess. Dust accumulates, rain washes it off, and the optical loss saturates non-linearly with accumulated mass:
 
 ```
-Soiling Loss (%) = PM_based_loss + Regional_characteristic
+PM split → daily deposition → rain cleaning → accumulation → nonlinear loss
 ```
 
-| Term | What it is | Where it comes from |
-|------|-----------|---------------------|
-| **PM_based_loss** | Baseline loss driven by particulate matter accumulation, attenuated by rainfall (a natural cleaning event) | PM10/PM2.5 (AirKorea) + rainfall (KMA), with different aggregation logic — PM is a *state* quantity averaged over time, rainfall is a *flow* quantity summed over time |
-| **Regional_characteristic** | The agent's **judgment layer** — a site-specific adjustment for soiling that PM data alone cannot capture | Derived by the agent from historical PM + rainfall patterns, **grounded in IEA PVPS Task 13 (T13-21:2022)** rather than personal opinion |
+| Stage | What it does |
+|-------|--------------|
+| **1. PM split** | `PM_coarse = max(PM10 − PM2.5, 0)` — coarse and fine settle at different rates |
+| **2. Deposition** | `Δm = 0.0864·cosθ·(v_f·PM2.5 + v_c·PM_coarse)·F_site`  [g/m²/day] |
+| **3. Rain cleaning** | `η_rain = η_max·[1 − exp(−k_R·(R − R0))]` above an effective threshold `R0` |
+| **4. Accumulation** | running dust mass with optional wind resuspension, reset by cleaning events |
+| **5. Nonlinear loss** | `SL = 1 − exp(−κ·mᵞ)` — loss saturates at high dust mass (10 g/m² ≈ 34%) |
 
-### Why two terms, and why grounded in IEA
+Annual loss is the (insolation-weightable) mean of daily `SL`. Two calibration constants carry the uncertainty the reports flag explicitly: a **global deposition calibration** (`DEPO_CAL`, academic velocities → Korean field soiling rates) and the **regional factor `F_site`**.
 
-The decision to ground judgments in IEA authority rather than my own 25 years of intuition is deliberate: in front of investors and customers, *"IEA PVPS reports it"* outweighs *"I think so"* — even when I'm right.
+### `F_site` — the regional judgment layer
 
-The IEA PVPS T13-21:2022 evidence base supports the second term directly:
+`F_site` (general = 1.0, scaled up for industrial / dry-agricultural / coastal sites) is where the agent's contextual judgment enters — the site-specific adjustment PM data alone cannot capture. It maps the sidebar's regional characteristics (agriculture, industry, roads, coast, low tilt) onto a single multiplier, and the `base` (F_site = 1) vs `total` split is preserved for audit.
 
-- **PM-only models systematically underestimate soiling.** Real soiling sources extend well beyond particulate matter — agricultural dust, pollen, bird droppings, industrial / brake / diesel particulates.
-- **Soiling varies 2–3× within a single site**, depending on wind direction and the spatial distribution of nearby sources.
-- IEA's macro soiling models incorporate land use, NDVI, agricultural activity, and soil type (e.g. `SR = a + b·PM10 + c·WS + d·RH`).
-- The **Burgdorf case study** (~10% loss in a humid region) demonstrates how badly a PM-only assumption can miss.
+The decision to ground judgments in IEA authority rather than my own 25 years of intuition is deliberate: in front of investors and customers, *"IEA PVPS reports it"* outweighs *"I think so"* — even when I'm right. The evidence base supports it directly:
 
-So `Regional_characteristic` is exactly the kind of contextual, evidence-anchored reasoning a human analyst would add — and exactly what the agent is being designed to do.
+- **PM-only models systematically underestimate soiling.** Real sources extend well beyond particulate matter — agricultural dust, pollen, bird droppings, industrial / brake / diesel particulates.
+- **Soiling varies 2–3× within a single site**, depending on wind direction and nearby sources.
+- Coarse clay / cement / ash particles adhere strongly; hygroscopic salts promote **caking** in humid / coastal sites.
+- The **~10% loss in humid-region case studies** shows how badly a PM-only assumption can miss.
+
+**Validation (Seosan, 2025 — real PM + ASOS rainfall):** general 3.4% / industrial 6.5% / heavy-pollution 9.4% — matching IEA's **3–5% world average** and **up to ~10%** for industrial / dry sites. This falls out of the physics + one deposition calibration, not curve-fitting to a target.
 
 ---
 
@@ -96,11 +101,32 @@ So `Regional_characteristic` is exactly the kind of contextual, evidence-anchore
 ```
 cleaning-agent-demo/
 ├── core/
-│   ├── agent_llm.py       # LLM agent: Anthropic tool-use loop + structured reasoning trace
-│   ├── lcoe.py            # LCOE / economic-impact simulator (verified port of the TS original)
-│   ├── kma_weather.py     # KMA API Hub surface-observation fetcher (rainfall; lat/lon direct)
-│   └── gk2a_aerosol.py    # GK2A satellite AOD extractor (built; excluded from this demo)
-├── app.py                 # Streamlit UI — renders the agent trace (💭 / 🔧 / 📝)
+│   │  # Agent orchestration
+│   ├── agent.py                 # Deterministic pipeline agent (non-LLM path)
+│   ├── agent_llm.py             # LLM agent: Anthropic tool-use loop + reasoning trace
+│   │  # Soiling model (active)
+│   ├── soiling_semiphysical.py  # Semi-physical 5-stage model (IEA T13 / Coello–Boyle) + F_site
+│   ├── soiling_knowledge.py     # Curated report knowledge injected into the LLM prompt
+│   ├── pollution_model.py       # Runs the model → daily soiling + cleaning priorities
+│   │  # Soiling model (legacy, preserved — not used by the pipeline)
+│   ├── soiling_hsu.py           # pvlib HSU model (superseded by semi-physical)
+│   ├── soiling_weights.py       # Old additive regional-weight heuristic
+│   │  # Data ingestion
+│   ├── airkorea_pm.py           # AirKorea PM10/PM2.5 (live + demo)
+│   ├── pm_statistics.py         # Monthly PM Excel loader with parquet cache
+│   ├── kma_weather.py           # KMA API Hub surface obs (rainfall; lat/lon direct)
+│   ├── asos_rainfall.py         # ASOS hourly rainfall → nearest-station daily series
+│   ├── asos_station_meta.py     # 97 ASOS station coordinates + Haversine distance
+│   │  # Economics
+│   └── lcoe.py                  # LCOE / economic-impact simulator (verified TS port)
+├── data/
+│   ├── pm_stats/                # AirKorea monthly PM Excel (2023–2025)
+│   └── raw_asos/                # ASOS hourly observation CSVs (cp949)
+├── app_streamlit.py            # Streamlit UI — renders the agent trace (💭 / 🔧 / 📝)
+├── app_fastapi.py              # FastAPI entrypoint (alternate surface)
+├── soiling_effect_4reports_model.py  # Reference implementation of the 5-stage model (from the 4-report summary)
+├── requirements.txt
+├── CHANGELOG.md                # Change history (see for the model-swap record)
 └── README.md
 ```
 
@@ -125,14 +151,16 @@ cleaning-agent-demo/
 
 **Working today**
 - LLM agent with tool-use loop and a transparent, auditable reasoning trace
+- **Semi-physical 5-stage soiling model** (IEA T13-21:2022 / Coello–Boyle), validated at 3–5% for general sites and up to ~10% for industrial/dry sites
+- **`F_site` regional layer** — sidebar characteristics → deposition multiplier, IEA-grounded
+- **ASOS hourly rainfall** integration (nearest-station by Haversine) feeding the cleaning term
 - LCOE / economic-impact engine (numerically verified against the production TS version)
 - KMA rainfall fetcher (coordinate-based, no grid conversion)
 
 **In progress**
 - AirKorea nearest-station lookup by coordinates → PM10/PM2.5
 - Geocoding (place name / map click → lat/lon)
-- Soiling-accumulation model connecting the PM and rainfall streams
-- `Regional_characteristic` analysis layer, fully grounded in the IEA framework
+- Field calibration of the model constants (κ, γ, v_f, v_c, R0) against reference-cell / soiling-sensor data
 
 This is a **demo, not a product**. It is intentionally separate from VigilAI's production infrastructure (React/TypeScript portal on AWS S3/CloudFront, ap-northeast-2).
 

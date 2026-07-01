@@ -10,6 +10,7 @@ import streamlit as st
 from core.agent import AgentRequest, REGION_CATALOG, run_cleaning_agent
 from core.agent_llm import run_llm_agent
 from core.lcoe import DEFAULT_INPUTS, LcoeInputs
+from core.soiling_semiphysical import fsite_from_characteristics
 from core.pm_statistics import (
     RegionPair, available_years, list_pm_stat_files, list_region_pairs,
     pm_stats_dir, pm_cache_status, precompute_pm_cache,
@@ -327,6 +328,7 @@ if "last_result" not in st.session_state or run:
         st.session_state["last_agent_mode"] = True
     else:
         with st.spinner("에이전트 분석 중"):
+            f_site_val, _ = fsite_from_characteristics(regional_characteristics)
             request = AgentRequest(
                 region_name=final_region,
                 region1=region1,
@@ -337,6 +339,7 @@ if "last_result" not in st.session_state or run:
                 lookback_years=lookback_years,
                 use_live_data=use_live_data,
                 live_weather_days_limit=live_weather_days_limit,
+                f_site=f_site_val,
                 top_n=top_n,
                 lcoe_inputs=lcoe_inputs,
             )
@@ -359,37 +362,58 @@ if result.pollution is not None and result.lcoe is not None and result.site is n
     metric_cols[2].metric("반영 후 LCOE", f"{result.lcoe.ref_lcoe:.2f} 원/kWh", f"+{result.lcoe.lcoe_increase:.2f}%")
     metric_cols[3].metric("분석 지점", result.site.name)
 
-    # HSU 모델 산출식 및 출처
-    with st.expander("📐 HSU 모델 산출식 및 출처", expanded=False):
-        st.markdown("""
-### HSU 소일링 모델 (Coello & Boyle 2019)
+    # 반물리 5단계 모델 산출식 및 출처
+    with st.expander("📐 반물리 5단계 소일링 모델 산출식 및 출처", expanded=False):
+        st.markdown(r"""
+### 반물리 5단계 소일링 모델 (IEA PVPS / Coello-Boyle 계열)
 
-**기본 원리:**
+대기 PM → 표면 퇴적 → 강우 세정 → 누적 → 비선형 발전손실의 5단계 물리 모델.
+
+**1단계 — 미세/조대입자 분리** (PM10에 PM2.5 중복 제거)
 ```
-소일링 손실(%) = (1 - SR) × 100
-여기서 SR = soiling_ratio (0~1, 1=완전 세척)
+PM_coarse = max(PM10 − PM2.5, 0)
 ```
 
-**침적 계산:**
-- PM2.5 침적 속도: 0.0009 m/s
-- PM10 침적 속도: 0.004 m/s
-- 일일 누적 침적량 계산
+**2단계 — 일 퇴적량** (g/m²/day)
+```
+Δm = 0.0864 · cosθ · (v_f·PM2.5 + v_c·PM_coarse) · F_site
+```
+- v_f=0.0009, v_c=0.004 m/s (PM2.5/조대 유효 퇴적속도)
+- DEPO_CAL=14 (학술 퇴적속도 → 국내 실측 소일링 보정)
+- F_site: 지역특성 계수 (일반=1.0, 산업/건조는 배수)
 
-**자연 세척:**
-- 강우 임계값: 0.5mm 이상 시 자동 세척
-- 일시간 단위 강우 누적으로 판정
+**3단계 — 강우 세정률**
+```
+η_rain = 0                          (R < R0)
+       = η_max·[1 − exp(−k_R·(R−R0))]  (R ≥ R0)
+```
+- η_max=0.8, R0=2.5mm, k_R=0.3
 
-**적용 파라미터:**
-- 경사각: 30° (한국 고정설치 표준)
-- PM 단위: AirKorea µg/m³ → pvlib g/m³ (×1e-6)
-- 강수: ASOS 관측 일강수량(mm)
+**4단계 — 누적 먼지량 (재비산 반영)**
+```
+m⁻ = max(0, m_{d-1} + Δm − ρ·m_{d-1})
+m  = m⁻ · (1 − η_rain) · (1 − η_manual)
+```
 
-**출처:**
-- Coello, C., & Boyle, L. (2019).
-- "Performance of soiled photovoltaic modules"
-- IEEE Journal of Photovoltaics, 9(5), 1382-1387
-- DOI: 10.1109/JPHOTOV.2019.2914786
-- Implementation: pvlib-python soiling.hsu()
+**5단계 — 비선형 발전손실**
+```
+SR = exp(−κ·m^γ),   SL = 1 − SR
+```
+- κ=0.0416 (PDF: 먼지 10g/m² → 34% 손실 기준), γ=1.0
+
+**연손실** = mean(SL) × 100
+
+**참고 보고서:**
+1. **IEA PVPS T13-21:2022** — *Soiling Losses – Impact on the Performance of
+   Photovoltaic Power Plants* (2022)
+2. **Systematic review of soiling mitigation strategies for solar photovoltaic
+   panels** (2026)
+
+**모델 원출처:**
+- Coello, C. & Boyle, L. (2019), *IEEE J. Photovoltaics* 9(5):1382-1387
+
+**검증(서산 2025):** 일반 3.4% / 산업 6.5% / 건조농업 8.0% / 극심 9.4%
+→ IEA 세계평균 3~5%, 산업·건조 ~10% 범위 부합
         """)
 
     left, right = st.columns([1.2, 0.8], gap="large")
@@ -434,27 +458,31 @@ if result.pollution is not None and result.lcoe is not None and result.site is n
         for item in result.pollution.assumptions:
             st.write(f"- {item}")
 
-    # 에이전트 모드이고 지역특성 결과가 있으면 표시
-    if is_agent_result and result.regional_weight is not None:
-        with st.expander("🌍 지역특성 분석"):
-            st.markdown(f"**최종 가중치: {result.regional_weight.total_ppt:+.3f}%p**")
-            st.markdown(f"가산 상한 적용: {'예' if result.regional_weight.capped else '아니오'}")
+    # 에이전트 모드이고 지역특성 결과가 있으면 표시 (F_site 내역)
+    if is_agent_result and getattr(result, "f_site_info", None) is not None:
+        info = result.f_site_info
+        with st.expander("🌍 지역특성 분석 (F_site)"):
+            st.markdown(f"**최종 F_site: {info['f_site']:.2f}** (일반=1.0, 산업/건조는 배수)")
 
-            # Breakdown 테이블
+            level_kr = {"low": "저", "mid": "중", "high": "고"}
             breakdown_data = []
-            for item in result.regional_weight.breakdown:
+            for b in info.get("breakdown", []):
                 breakdown_data.append({
-                    "규칙": item.rule_id,
-                    "이름": item.name,
-                    "강도": {"low": "저", "mid": "중", "high": "고"}.get(item.level, item.level),
-                    "가중값(%p)": f"{item.value_ppt:+.2f}",
-                    "출처": item.source,
+                    "지역요인": b["label"],
+                    "강도": level_kr.get(b["level"], b["level"]),
+                    "F_site 증분": f"+{b['increment']:.2f}",
                 })
             if breakdown_data:
                 breakdown_df = pd.DataFrame(breakdown_data)
                 st.dataframe(breakdown_df, use_container_width=True, hide_index=True)
+            else:
+                st.caption("선택된 지역특성 없음 → 일반 지역(F_site=1.0)")
 
-            st.caption(result.regional_weight.note)
+            st.caption(
+                f"R6 봄철황사 판정: {level_kr.get(info.get('r6_dust_level'), '-')}, "
+                f"R7 강수세척 판정: {level_kr.get(info.get('r7_rainfall_level'), '-')} "
+                "— 실측 PM·강수로 모델에 내재 반영 (F_site 별도 가산 없음)"
+            )
 
 else:
     if is_agent_result:

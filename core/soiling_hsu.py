@@ -29,7 +29,7 @@ except ImportError:
 # HSU 모델 설정 (IEEE 논문 + 한국 환경 기반)
 HSU_CONFIG = {
     "surface_tilt_deg": 30,        # 한국 고정 설치 경사각 (30°)
-    "cleaning_threshold_mm": 0.5,  # 강우로 인한 자연 세척 임계값 (Coello 0.5mm)
+    "cleaning_threshold_mm": 10,   # 강우로 인한 자연 세척 임계값 (10mm - 강한 비)
     "rain_accum_period": "1h",     # pvlib 기본값 (시간 단위 적분)
     # depo_veloc=None → pvlib 기본값 {'2_5': 0.0009, '10': 0.004} m/s
 }
@@ -140,13 +140,22 @@ def run_hsu_model(
     # 손실률 > 2%인 날 수
     days_exceed_2 = int((daily_loss > 2).sum())
 
-    # 일별 상세 데이터
+    # 일별 상세 데이터 (일별 강수 재집계)
     daily_data = []
+    rainfall_daily = rain.resample("D").sum()  # 시간별 → 일별 강수
+
     for d, loss in daily_loss.items():
+        # 해당 날짜의 강수량
+        try:
+            rainfall_mm = float(rainfall_daily[d])
+        except (KeyError, TypeError):
+            rainfall_mm = 0.0
+
         daily_data.append(
             {
                 "date": d.date(),
                 "loss_pct": round(float(loss), 3),
+                "rainfall_mm": round(rainfall_mm, 1),
             }
         )
 

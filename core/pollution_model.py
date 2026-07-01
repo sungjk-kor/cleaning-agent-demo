@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass
 from datetime import date, timedelta
 from typing import Literal, Mapping
 
-from .soiling_hsu import run_hsu_model
+from .soiling_semiphysical import run_semiphysical_model
 
 
 @dataclass
@@ -247,27 +247,42 @@ def simulate_cleaning_decision(
     capacity_kw: float,
     util_rate_pct: float,
     top_n: int = 5,
-    regional_weight_ppt: float = 0.0,
-    model_name: Literal["pm", "hsu"] = "pm",
+    regional_weight_ppt: float = 0.0,  # (구) 가산식 — 신모델에서는 미사용, 호환 유지
+    model_name: str = "semiphysical",
+    f_site: float = 1.0,
 ) -> PollutionModelResult:
     """
-    Run the full soiling model with regional characteristics and return annual loss and top priorities.
+    반물리 5단계 소일링 모델로 연손실과 세척 우선순위 산출.
 
-    최종 손실 = HSU 모델 손실 + 지역특성 가중치
+    최종 손실 = 반물리 모델(F_site 적용)
+    audit 분리: base = F_site 1.0(PM/강수 기반), regional = F_site 효과 증가분
 
     Args:
         rainfall_by_date: pd.Series(hourly, DatetimeIndex) 권장 | dict[date: mm]
-        model_name: HSU 모델만 지원 (근거 있는 IEEE 논문 기반)
+        f_site: 지역특성 계수 (1.0=일반, 산업/건조는 배수). 지역특성에서 매핑됨.
+        model_name: "semiphysical" (반물리 5단계, IEA 보고서 기반)
     """
-    # HSU 모델만 사용 (유일한 분석 모델)
-    hsu_result = run_hsu_model(rainfall_by_date, pm_by_date, start, end)
+    # 전체 손실 (실제 F_site 적용)
+    total_result = run_semiphysical_model(
+        rainfall_by_date, pm_by_date, start, end, f_site_override=f_site
+    )
+    # 기저 손실 (F_site=1, PM/강수만) — audit 분리용
+    if abs(f_site - 1.0) < 1e-9:
+        base_result = total_result
+    else:
+        base_result = run_semiphysical_model(
+            rainfall_by_date, pm_by_date, start, end, f_site_override=1.0
+        )
+    base_by_date = {item["date"]: item["loss_pct"] for item in base_result.daily}
 
-    # HSU 결과를 DailySoiling 형태로 변환
+    # 반물리 결과를 DailySoiling 형태로 변환 (base/regional 분리)
     daily: list[DailySoiling] = []
-    for item in hsu_result.daily:
+    for item in total_result.daily:
         d = item["date"]
-        loss_pct = item["loss_pct"]
-        rainfall = float(rainfall_by_date.get(d, 0.0) or 0.0)
+        total_loss = item["loss_pct"]
+        base_loss = base_by_date.get(d, total_loss)
+        regional_ppt = total_loss - base_loss  # F_site로 늘어난 손실 (%p)
+        rainfall_mm = item.get("rainfall_mm", 0.0)
         pm = pm_by_date.get(d, {})
         pm10 = pm.get("pm10")
         pm25 = pm.get("pm25")
@@ -275,14 +290,14 @@ def simulate_cleaning_decision(
         daily.append(
             DailySoiling(
                 date=d,
-                rainfall_mm=round(rainfall, 2),
+                rainfall_mm=round(rainfall_mm, 2),
                 pm10=round(pm10, 2) if pm10 is not None else None,
                 pm25=round(pm25, 2) if pm25 is not None else None,
-                dry_days=0,  # HSU는 dry_days를 직접 사용하지 않음
-                pm_based_soiling_pct=round(loss_pct, 3),
-                regional_weight_ppt=round(regional_weight_ppt, 3),
-                soiling_loss_pct=round(loss_pct + regional_weight_ppt / 100, 3),
-                priority_score=round(loss_pct, 3),  # HSU에서는 priority_score = loss_pct
+                dry_days=0,
+                pm_based_soiling_pct=round(base_loss, 3),       # F_site=1 기저
+                regional_weight_ppt=round(regional_ppt, 3),     # F_site 증가분
+                soiling_loss_pct=round(total_loss, 3),          # 최종(F_site 적용)
+                priority_score=round(total_loss, 3),
             )
         )
 
@@ -298,28 +313,23 @@ def simulate_cleaning_decision(
     if daily:
         annual_pollution_loss_pct = sum(row.soiling_loss_pct for row in daily) / len(daily)
         annual_pm_loss_pct = sum(row.pm_based_soiling_pct for row in daily) / len(daily)
+        annual_regional_ppt = sum(row.regional_weight_ppt for row in daily) / len(daily)
     else:
         annual_pollution_loss_pct = 0.0
         annual_pm_loss_pct = 0.0
+        annual_regional_ppt = 0.0
     annual_base_gen = capacity_kw * 8760 * (util_rate_pct / 100)
     annual_generation_loss = annual_base_gen * (annual_pollution_loss_pct / 100)
 
-    # HSU 모델 가정사항
-    assumptions = [
-        "HSU 모델 (Coello & Boyle 2019, IEEE J. Photovoltaics 9(5):1382-1387)",
-        "경사각: 30° (한국 고정설치 표준)",
-        "침적 속도: PM2.5 0.0009 m/s, PM10 0.004 m/s (pvlib 기본값)",
-        "강우 세척 임계값: 0.5mm (IEEE 논문 기반)",
-        "PM 단위: AirKorea µg/m³ → pvlib g/m³ (×1e-6) 변환",
-        "강수: ASOS 관측 일강수량(mm)",
-    ]
+    # 반물리 모델 가정사항 (신모델에서 직접 가져옴)
+    assumptions = list(total_result.assumptions)
 
     return PollutionModelResult(
         daily=daily,
         priorities=priorities,
         annual_pollution_loss_pct=round(annual_pollution_loss_pct, 3),
         annual_pm_loss_pct=round(annual_pm_loss_pct, 3),
-        annual_regional_weight_ppt=round(regional_weight_ppt, 3),
+        annual_regional_weight_ppt=round(annual_regional_ppt, 3),
         annual_generation_loss_kwh=round(annual_generation_loss, 1),
         assumptions=assumptions,
         model_name=model_name,

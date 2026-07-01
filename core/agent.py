@@ -47,9 +47,6 @@ class AgentRequest:
     end_date: date | None = None
     lookback_years: int | None = 1
     lookback_days: int = 365
-    use_live_data: bool = False
-    live_weather_days_limit: int = 10
-    use_asos_rainfall: bool = True  # ASOS 실측 강수 사용 여부 (기본값: True)
     f_site: float = 1.0  # 지역특성 계수 (1.0=일반, 산업/건조는 배수)
     pm_stats_dir: str | None = None
     top_n: int = 5
@@ -164,19 +161,22 @@ def _demo_rainfall(start: date, end: date, seed_text: str) -> dict[date, float]:
     return rainfall
 
 
+# KMA API는 시간당 1회 호출 구조 → 장기간 조회 시 수십 분 소요.
+# ASOS 없을 때 fallback으로 최대 이 일수까지만 KMA 조회.
+_KMA_FALLBACK_MAX_DAYS = 30
+
+
 def _collect_rainfall(site: Site, start: date, end: date, req: AgentRequest):
     """
-    강수량 수집: ASOS 실측(시간 단위) → 데모 시뮬레이션 → KMA API (최근 N일).
-
-    우선순위:
-      1. use_asos_rainfall=True → ASOS 시간 강수(권장)
-      2. 아니면 → 데모 강수 시계열(일 단위)
-      3. use_live_data=True → KMA API로 최근 N일 덮어씀(일 단위)
+    강수량 수집 우선순위:
+      1. ASOS CSV (data/raw_asos/) — 시간 단위 실측, 전체 기간 커버
+      2. ASOS 없으면 → KMA API 최근 30일 (KMA_API_KEY 필요) + 데모로 이전 기간 보완
+      3. KMA KEY도 없으면 → 데모 강수 시계열 전체
 
     Returns:
-        (rainfall_input, notes) where:
-          rainfall_input: pd.Series(hourly, DatetimeIndex) if ASOS
-                         or dict[date, float] if demo/KMA
+        (rainfall_input, notes)
+          rainfall_input: pd.Series(hourly DatetimeIndex) if ASOS
+                         or dict[date, float] if KMA/demo
           notes: list[str]
     """
     import pandas as pd
@@ -184,70 +184,87 @@ def _collect_rainfall(site: Site, start: date, end: date, req: AgentRequest):
     rainfall_input = None
     notes: list[str] = []
 
-    # Step 1: ASOS 실측 강수 시도 (시간 단위)
-    if req.use_asos_rainfall:
-        try:
-            asos_data_hourly = load_asos_range(start.year, end.year)
-            if asos_data_hourly and site.lat and site.lon:
-                asos_rainfall_hourly = get_region_hourly_precip(asos_data_hourly, site.lat, site.lon)
-                # 분석 기간 내의 ASOS 데이터만 사용
-                if len(asos_rainfall_hourly) > 0:
-                    mask = (asos_rainfall_hourly.index.date >= start) & (asos_rainfall_hourly.index.date <= end)
-                    rainfall_input = asos_rainfall_hourly[mask]
-                    if len(rainfall_input) > 0:
-                        rainy_hours = (rainfall_input > 0.0).sum()
+    # Step 1: ASOS CSV 실측 강수 (시간 단위, 전체 기간)
+    try:
+        asos_data_hourly = load_asos_range(start.year, end.year)
+        if asos_data_hourly and site.lat and site.lon:
+            asos_rainfall_hourly = get_region_hourly_precip(asos_data_hourly, site.lat, site.lon)
+            if len(asos_rainfall_hourly) > 0:
+                mask = (asos_rainfall_hourly.index.date >= start) & (asos_rainfall_hourly.index.date <= end)
+                sliced = asos_rainfall_hourly[mask]
+                if len(sliced) > 0:
+                    asos_start_dt = sliced.index[0].date()
+                    asos_end_dt = sliced.index[-1].date()
+
+                    if asos_start_dt <= start and asos_end_dt >= end:
+                        # ASOS가 분석 기간 전체를 커버
+                        rainfall_input = sliced
+                        rainy_hours = (sliced > 0.0).sum()
                         notes.append(
                             f"ASOS 시간 강수(실측값)을 {start} ~ {end} 구간에 적용했습니다 "
-                            f"({len(rainfall_input)}시간, {rainy_hours}시간 강우)."
+                            f"({len(sliced)}시간, {rainy_hours}시간 강우)."
                         )
                     else:
-                        rainfall_input = None
-                        notes.append("ASOS 데이터를 로드했으나 분석 기간에 데이터가 없습니다.")
-                else:
-                    notes.append("ASOS 데이터를 로드했으나 지역에 매칭되는 지점이 없습니다.")
-        except Exception as exc:
-            notes.append(f"ASOS 실측값 로드 실패: {exc}")
+                        # ASOS가 일부 기간만 커버 → 빠진 기간은 데모 강수로 보완
+                        asos_daily = {
+                            ts.date(): float(v)
+                            for ts, v in sliced.resample("D").sum().items()
+                        }
+                        demo_rain = _demo_rainfall(start, end, site.name)
+                        merged = dict(demo_rain)
+                        merged.update(asos_daily)  # ASOS가 있는 날짜는 실측값으로 덮어씀
+                        rainfall_input = merged
 
-    # Step 2: 데모 강수 (ASOS 없거나 실패 시 보충) - 일 단위
+                        gaps = []
+                        if asos_start_dt > start:
+                            gaps.append(f"{start} ~ {asos_start_dt - timedelta(1)}")
+                        if asos_end_dt < end:
+                            gaps.append(f"{asos_end_dt + timedelta(1)} ~ {end}")
+                        gap_str = ", ".join(gaps)
+                        rainy_days = sum(1 for v in asos_daily.values() if v > 0)
+                        notes.append(
+                            f"ASOS 실측 강수({asos_start_dt} ~ {asos_end_dt})가 분석 기간 "
+                            f"({start} ~ {end}) 일부만 커버합니다 ({rainy_days}일 강우). "
+                            f"미포함 기간({gap_str})은 데모 강수로 보완했습니다."
+                        )
+    except Exception as exc:
+        notes.append(f"ASOS CSV 로드 실패: {exc}")
+
+    if rainfall_input is not None:
+        return rainfall_input, notes
+
+    # Step 2: ASOS 없음 → KMA API fallback (최근 30일 한도)
+    if os.environ.get("KMA_API_KEY"):
+        total_days = (end - start).days + 1
+        kma_days = min(total_days, _KMA_FALLBACK_MAX_DAYS)
+        kma_start = end - timedelta(days=kma_days - 1)
+        try:
+            rows = fetch_kma_surface(
+                site.lat, site.lon,
+                datetime.combine(kma_start, datetime.min.time()).strftime("%Y%m%d%H%M"),
+                datetime.combine(end, datetime.max.time()).strftime("%Y%m%d%H%M"),
+                sleep_sec=0.15,
+            )
+            kma_rain = daily_rainfall_mm(rows)
+            # KMA 커버 이전 기간은 데모로 보완
+            demo_rain = _demo_rainfall(start, end, site.name)
+            demo_rain.update({d: float(v) for d, v in kma_rain.items() if start <= d <= end})
+            rainfall_input = demo_rain
+            notes.append(
+                f"ASOS CSV 없음 — KMA API 최근 {kma_days}일 실측 반영 "
+                f"({kma_start} ~ {end}), 이전 기간은 데모 강수로 보완했습니다."
+            )
+        except Exception as exc:
+            notes.append(f"KMA API 조회 실패: {exc}")
+    else:
+        notes.append(
+            "ASOS CSV(data/raw_asos/)가 없고 KMA_API_KEY도 미설정 — 데모 강수를 사용합니다."
+        )
+
+    # Step 3: 최종 fallback — 데모 강수
     if rainfall_input is None:
         rainfall_input = _demo_rainfall(start, end, site.name)
-        notes.append("기상 데이터: 기본 데모 강수 시계열을 생성했습니다 (일별).")
-
-    # Step 3: KMA API로 최근 N일 덮어씀 (선택사항) - 일 단위만 가능
-    if not req.use_live_data:
-        return rainfall_input, notes
-
-    if not os.environ.get("KMA_API_KEY"):
-        notes.append("KMA_API_KEY가 없어 기상청 실조회를 건너뜁니다.")
-        return rainfall_input, notes
-
-    # rainfall_input이 Series면 일별로 변환 후 KMA와 병합
-    if isinstance(rainfall_input, pd.Series):
-        rainfall_dict = rainfall_input.resample("D").sum().to_dict()
-        rainfall_dict = {d: v for d, v in rainfall_dict.items() if isinstance(d, date) or hasattr(d, 'date')}
-        # Timestamp → date 변환
-        rainfall_dict = {d.date() if hasattr(d, 'date') else d: v for d, v in rainfall_dict.items()}
-    else:
-        rainfall_dict = rainfall_input.copy()
-
-    live_days = max(1, min(req.live_weather_days_limit, (end - start).days + 1))
-    live_start = end - timedelta(days=live_days - 1)
-    try:
-        rows = fetch_kma_surface(
-            site.lat,
-            site.lon,
-            datetime.combine(live_start, datetime.min.time()).strftime("%Y%m%d%H%M"),
-            datetime.combine(end, datetime.max.time()).strftime("%Y%m%d%H%M"),
-            sleep_sec=0.15,
-        )
-        live_rain = daily_rainfall_mm(rows)
-        rainfall_dict.update({d: float(v) for d, v in live_rain.items() if start <= d <= end})
-        notes.append(
-            f"기상청 KMA 지상관측을 최근 {live_days}일 구간에 반영했습니다."
-        )
-        rainfall_input = rainfall_dict  # KMA 적용 후 일별로 반환
-    except Exception as exc:
-        notes.append(f"기상청 실조회 실패: {exc}")
+        notes.append("기상 데이터: 데모 강수 시계열을 사용했습니다 (일별).")
 
     return rainfall_input, notes
 

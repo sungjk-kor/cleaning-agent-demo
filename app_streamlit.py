@@ -7,7 +7,7 @@ from datetime import date
 import pandas as pd
 import streamlit as st
 
-from core.agent import AgentRequest, REGION_CATALOG, run_cleaning_agent
+from core.agent import REGION_CATALOG, AgentRequest, run_cleaning_agent
 from core.agent_llm import run_llm_agent
 from core.lcoe import DEFAULT_INPUTS, LcoeInputs
 from core.soiling_semiphysical import fsite_from_characteristics
@@ -32,6 +32,25 @@ except Exception:
 
 def _env_status(name: str) -> str:
     return "설정됨" if os.environ.get(name) else "없음"
+
+
+@st.cache_data(ttl=60)
+def _list_asos_csv() -> list[str]:
+    d = os.path.join("data", "raw_asos")
+    if not os.path.isdir(d):
+        return []
+    return [f for f in os.listdir(d) if f.lower().endswith(".csv")]
+
+
+@st.cache_data(ttl=60)
+def _asos_available_years() -> list[int]:
+    import re
+    years = []
+    for f in _list_asos_csv():
+        m = re.search(r"(20\d{2})", f)
+        if m:
+            years.append(int(m.group(1)))
+    return sorted(years)
 
 
 def _build_lcoe_inputs() -> LcoeInputs:
@@ -209,10 +228,17 @@ with st.sidebar:
 
     year_options = list(available_years()) or [date.today().year]
     end_year = st.selectbox("기준 연도", options=year_options, index=len(year_options) - 1)
-    lookback_years = st.selectbox("분석 기간", [1, 2, 3, 4, 5], index=0, format_func=lambda v: f"최근 {v}년")
+
+    asos_years = _asos_available_years()
+    if asos_years:
+        max_lookback = max(1, min(5, int(end_year) - min(asos_years) + 1))
+    else:
+        max_lookback = 5
+    lookback_options = list(range(1, max_lookback + 1))
+    lookback_years = st.selectbox("분석 기간", lookback_options, index=0, format_func=lambda v: f"최근 {v}년")
+    if asos_years and max_lookback < 5:
+        st.caption(f"ASOS 실측 강수: {min(asos_years)}~{max(asos_years)}년 · 최대 {max_lookback}년")
     end_date = date(int(end_year), 12, 31)
-    use_live_data = st.toggle("KMA 실 API 강수 반영", value=False)
-    live_weather_days_limit = st.slider("KMA 실조회 일수", min_value=1, max_value=14, value=5)
     top_n = st.slider("세척 후보 수", min_value=3, max_value=10, value=5)
 
     lcoe_inputs = _build_lcoe_inputs()
@@ -275,17 +301,19 @@ with st.sidebar:
         st.caption("※ R6(봄철 황사), R7(강수세척)은 AI가 PM·강수 데이터를 보고 판정합니다.")
 
     st.divider()
-    agent_mode = st.toggle(
-        "에이전트 모드 (LLM)",
-        value=False,
-        help="Anthropic API를 호출해 LLM이 도구 순서를 직접 결정합니다. ANTHROPIC_API_KEY 필요. 30~60초 소요.",
-    )
+    st.write("")
+    st.write("")
+    st.write("")
+    st.write("")
+    st.write("")
+    st.write("")
+    run_quick = st.button("빠른 결과 보기 (AI 없이)", use_container_width=True)
+    st.caption("ASOS·PM 데이터로 즉시 계산합니다 · 예상 소요: 3~5초")
 
     st.caption(f"PM 통계 폴더: {pm_stats_dir()}")
     st.caption(f"PM 통계 파일: {len(pm_files)}개")
     st.caption(f"KMA_API_KEY: {_env_status('KMA_API_KEY')}")
-    if agent_mode:
-        st.caption(f"ANTHROPIC_API_KEY: {_env_status('ANTHROPIC_API_KEY')}")
+    st.caption(f"ANTHROPIC_API_KEY: {_env_status('ANTHROPIC_API_KEY')}")
 
     # PM 캐시 빌드 (파일이 있을 때만 표시)
     if pm_files:
@@ -307,15 +335,77 @@ with st.sidebar:
         else:
             st.caption(f"PM 캐시: {cached_n}/{total_n} 완료")
 
-    run = st.button("분석 실행", type="primary", use_container_width=True)
+    st.divider()
+    st.write("")
+    st.write("")
+    st.write("")
+    st.write("")
+    st.write("")
+    st.write("")
+    run = st.button("인공지능 보고서 생성하기", type="primary", use_container_width=True)
+    st.caption("AI가 지역특성을 판단하고 심층 보고서를 생성합니다 · 예상 소요: 30~60초")
+
+    # 빠른 결과 보기 버튼만 파란색으로 (expander 안의 버튼은 제외)
+    # 사이드바 간격 축소
+    st.markdown("""
+<style>
+section[data-testid="stSidebar"] .stButton button[kind="secondary"] {
+    background-color: #1565C0;
+    color: white;
+    border: 1px solid #0D47A1;
+}
+section[data-testid="stSidebar"] .stButton button[kind="secondary"]:hover {
+    background-color: #0D47A1;
+    border-color: #003c8f;
+}
+section[data-testid="stSidebar"] [data-testid="stExpander"] .stButton button[kind="secondary"] {
+    background-color: #e8e8e8;
+    color: #333;
+    border: 1px solid #ccc;
+}
+section[data-testid="stSidebar"] [data-testid="stExpander"] .stButton button[kind="secondary"]:hover {
+    background-color: #d0d0d0;
+    border-color: #bbb;
+}
+
+/* 사이드바 메뉴 간격 축소 */
+section[data-testid="stSidebar"] {
+    gap: 0.1rem !important;
+}
+section[data-testid="stSidebar"] > div:first-child {
+    gap: 0.1rem !important;
+}
+section[data-testid="stSidebar"] .element-container {
+    margin-bottom: 0.1rem !important;
+    margin-top: 0 !important;
+    padding: 0 !important;
+}
+section[data-testid="stSidebar"] [data-testid="stVerticalBlock"] {
+    gap: 0.1rem !important;
+}
+section[data-testid="stSidebar"] .stCaption {
+    margin-bottom: 0.15rem !important;
+    margin-top: -0.3rem !important;
+}
+section[data-testid="stSidebar"] hr {
+    margin: 0.3rem 0 !important;
+}
+</style>
+""", unsafe_allow_html=True)
 
 
 # ── Run logic ─────────────────────────────────────────────────────────────────
 
-if "last_result" not in st.session_state or run:
-    if agent_mode:
-        start_date = date(int(end_year) - lookback_years + 1, 1, 1)
-        with st.spinner("LLM 에이전트 분석 중 (30~60초 소요됩니다)..."):
+if run:
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        st.error(
+            "ANTHROPIC_API_KEY가 설정되지 않았습니다. "
+            ".env 파일 또는 Streamlit Secrets를 확인하세요."
+        )
+        st.stop()
+    start_date = date(int(end_year) - lookback_years + 1, 1, 1)
+    with st.spinner("AI 에이전트 분석 중 (30~60초 소요됩니다)..."):
+        try:
             st.session_state["last_result"] = run_llm_agent(
                 region_name=final_region,
                 start_date=start_date,
@@ -325,32 +415,58 @@ if "last_result" not in st.session_state or run:
                 top_n=top_n,
                 regional_characteristics=regional_characteristics,
             )
-        st.session_state["last_agent_mode"] = True
-    else:
-        with st.spinner("에이전트 분석 중"):
-            f_site_val, _ = fsite_from_characteristics(regional_characteristics)
-            request = AgentRequest(
-                region_name=final_region,
-                region1=region1,
-                region2=region2,
-                lat=lat,
-                lon=lon,
-                end_date=end_date,
-                lookback_years=lookback_years,
-                use_live_data=use_live_data,
-                live_weather_days_limit=live_weather_days_limit,
-                f_site=f_site_val,
-                top_n=top_n,
-                lcoe_inputs=lcoe_inputs,
-            )
-            st.session_state["last_result"] = run_cleaning_agent(request)
-        st.session_state["last_agent_mode"] = False
+            st.session_state["last_is_llm"] = True
+        except Exception as exc:
+            st.error(f"에이전트 실행 오류: {exc}")
+            st.stop()
+
+elif run_quick:
+    # 누락 항목 확인 — 분석은 항상 실행하되, 데모 데이터 사용 시 안내
+    missing_msgs: list[str] = []
+    if not pm_files:
+        missing_msgs.append(
+            "PM 통계 엑셀 파일 없음 → data/pm_stats/ 폴더에 .xlsx 파일을 추가해 주세요"
+        )
+    if not _list_asos_csv():
+        missing_msgs.append(
+            "ASOS 강수 CSV 없음 → data/raw_asos/ 폴더에 CSV 파일을 추가해 주세요"
+        )
+    if missing_msgs:
+        st.warning(
+            "아래 항목이 없어 **데모 데이터**로 대체합니다. "
+            "정확한 분석을 원하시면 항목을 추가하고 다시 클릭해 주세요.\n\n"
+            + "\n\n".join(f"- {m}" for m in missing_msgs)
+        )
+
+    f_site_val, _ = fsite_from_characteristics(regional_characteristics)
+    request = AgentRequest(
+        region_name=final_region,
+        region1=region1,
+        region2=region2,
+        lat=lat,
+        lon=lon,
+        end_date=end_date,
+        lookback_years=lookback_years,
+        f_site=f_site_val,
+        top_n=top_n,
+        lcoe_inputs=lcoe_inputs,
+    )
+    with st.spinner("빠른 분석 중..."):
+        st.session_state["last_result"] = run_cleaning_agent(request)
+    st.session_state["last_is_llm"] = False
+
+if "last_result" not in st.session_state:
+    st.info(
+        "분석 버튼을 클릭하세요.\n\n"
+        "- **인공지능 보고서 생성하기**: AI가 지역특성을 판단하고 심층 보고서를 작성합니다 (30~60초)\n"
+        "- **빠른 결과 보기**: AI 없이 데이터 기반으로 즉시 계산합니다 (3~5초)"
+    )
+    st.stop()
 
 
 # ── Main display ──────────────────────────────────────────────────────────────
 
 result = st.session_state["last_result"]
-is_agent_result = st.session_state.get("last_agent_mode", False)
 
 if result.pollution is not None and result.lcoe is not None and result.site is not None:
     daily_df = _daily_frame(result)
@@ -426,13 +542,12 @@ SR = exp(−κ·m^γ),   SL = 1 − SR
         for note in result.data_notes:
             st.write(f"- {note}")
 
-    real_rain_used = any(
-        "KMA" in note and "반영" in note for note in (result.data_notes or [])
-    )
-    if not real_rain_used:
+    using_demo_rain = any("데모 강수" in note for note in (result.data_notes or []))
+    if using_demo_rain:
         st.info(
-            "본 데모의 강수 데이터는 KMA 실측 연동 전 단계로, "
-            "통계 시뮬레이션 값을 사용합니다. 실측 API 연동은 로드맵에 포함돼 있습니다.",
+            "강수 데이터: ASOS CSV(data/raw_asos/)가 없고 KMA_API_KEY도 미설정 — "
+            "데모 시뮬레이션 값을 사용합니다. "
+            "data/raw_asos/ 폴더에 ASOS 관측 CSV를 추가하면 실측 강수가 자동 반영됩니다.",
             icon="ℹ️",
         )
 
@@ -447,21 +562,21 @@ SR = exp(−κ·m^γ),   SL = 1 − SR
         st.subheader("미세먼지")
         st.line_chart(daily_df[["pm10", "pm25"]])
 
-    if is_agent_result:
+    if st.session_state.get("last_is_llm", False):
         if st.button("📋 보고서 열기", type="secondary"):
             _show_report_dialog(result.report_markdown)
     else:
-        st.subheader("리포트")
-        st.markdown(result.report_markdown)
+        with st.expander("📋 분석 리포트", expanded=True):
+            st.markdown(result.report_markdown)
 
     with st.expander("모델 가정"):
         for item in result.pollution.assumptions:
             st.write(f"- {item}")
 
-    # 에이전트 모드이고 지역특성 결과가 있으면 표시 (F_site 내역)
-    if is_agent_result and getattr(result, "f_site_info", None) is not None:
+    if getattr(result, "f_site_info", None) is not None:
         info = result.f_site_info
-        with st.expander("🌍 지역특성 분석 (F_site)"):
+        source_label = info.get("source", "사용자 입력")
+        with st.expander(f"🌍 지역특성 분석 (F_site) — {source_label}"):
             st.markdown(f"**최종 F_site: {info['f_site']:.2f}** (일반=1.0, 산업/건조는 배수)")
 
             level_kr = {"low": "저", "mid": "중", "high": "고"}
@@ -471,12 +586,13 @@ SR = exp(−κ·m^γ),   SL = 1 − SR
                     "지역요인": b["label"],
                     "강도": level_kr.get(b["level"], b["level"]),
                     "F_site 증분": f"+{b['increment']:.2f}",
+                    "출처": source_label,
                 })
             if breakdown_data:
                 breakdown_df = pd.DataFrame(breakdown_data)
                 st.dataframe(breakdown_df, use_container_width=True, hide_index=True)
             else:
-                st.caption("선택된 지역특성 없음 → 일반 지역(F_site=1.0)")
+                st.caption("해당 지역특성 없음 → 일반 지역(F_site=1.0)")
 
             st.caption(
                 f"R6 봄철황사 판정: {level_kr.get(info.get('r6_dust_level'), '-')}, "
@@ -485,14 +601,10 @@ SR = exp(−κ·m^γ),   SL = 1 − SR
             )
 
 else:
-    if is_agent_result:
-        if st.button("📋 보고서 열기", type="secondary"):
-            _show_report_dialog(result.report_markdown or "")
-    else:
-        st.subheader("리포트")
+    with st.expander("📋 분석 리포트", expanded=True):
         st.markdown(result.report_markdown or "분석 결과가 없습니다.")
 
 # ── Agent trace panel ──────────────────────────────────────────────────────────
 
-if is_agent_result and hasattr(result, "trace"):
+if st.session_state.get("last_is_llm", False) and hasattr(result, "trace"):
     _render_trace(result.trace)

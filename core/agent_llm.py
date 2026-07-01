@@ -20,7 +20,7 @@ from .agent import (
     _collect_pm,
     build_report,
 )
-from .lcoe import DEFAULT_INPUTS, LcoeResult, calculate_lcoe
+from .lcoe import DEFAULT_INPUTS, calculate_lcoe
 from .pollution_model import PollutionModelResult, simulate_cleaning_decision
 from .soiling_knowledge import REPORT_KNOWLEDGE
 from .soiling_semiphysical import fsite_from_characteristics
@@ -140,9 +140,11 @@ TOOLS: list[dict] = [
         "name": "evaluate_regional_characteristics",
         "description": (
             "지역 특성(농업지역, 산업, 해안 등)을 종합하여 "
-            "소일링 손실 가중치를 계산합니다. "
-            "사용자가 R1~R5를 선택하고, AI가 R6(황사/고농도)·R7(강수세척)을 판정합니다. "
-            "수집된 PM·강수 데이터를 기반으로 강도를 판정하세요."
+            "소일링 손실 가중치(F_site)를 계산합니다. "
+            "사용자가 R1~R5를 선택한 경우 그 값이 우선 적용됩니다. "
+            "사용자가 아무것도 선택하지 않은 경우에는 AI가 지역명·PM·강수 데이터를 "
+            "근거로 R1~R5를 직접 판정하여 입력하세요. "
+            "R6(황사/고농도)·R7(강수세척)은 항상 AI가 PM·강수 데이터로 판정합니다."
         ),
         "input_schema": {
             "type": "object",
@@ -220,7 +222,7 @@ _SYSTEM_PROMPT = """당신은 태양광 발전소 패널 세척 판단 전문 �
 1. resolve_site: 지역 사이트 확정
 2. get_rainfall: 강수량 데이터 수집
 3. get_pm: 미세먼지 데이터 수집
-4. evaluate_regional_characteristics: 지역특성 평가 (R1~R5는 사용자 입력값 → F_site 계수, R6~R7은 PM·강수 데이터로 판정)
+4. evaluate_regional_characteristics: 지역특성 평가 (R1~R5는 사용자 입력값 우선; 사용자 미선택 시 AI가 지역명·PM·강수 데이터로 직접 판정. R6~R7은 항상 AI 판정)
 5. run_pollution_model: 반물리 5단계 소일링 모델 실행 및 세척 우선순위 계산 (F_site 반영)
 6. run_lcoe: LCOE 영향 분석
 
@@ -266,7 +268,6 @@ def _make_agent_request(
     site: Site,
     start: date,
     end: date,
-    use_live: bool = False,
     pm_stats_dir: str | None = None,
 ) -> AgentRequest:
     parts = site.name.split(maxsplit=1)
@@ -281,7 +282,6 @@ def _make_agent_request(
         sido=site.sido,
         start_date=start,
         end_date=end,
-        use_live_data=use_live,
         pm_stats_dir=pm_stats_dir,
     )
 
@@ -345,7 +345,6 @@ def run_llm_agent(
 
         start_str = inp.get("start_date")
         end_str = inp.get("end_date")
-        use_live = bool(inp.get("use_live", False))
 
         default_start, default_end = _default_period()
         start = date.fromisoformat(start_str) if start_str else default_start
@@ -354,16 +353,16 @@ def run_llm_agent(
         state["start_date"] = start
         state["end_date"] = end
 
-        req = _make_agent_request(
-            state["site"], start, end, use_live, state["pm_stats_dir"]
-        )
+        req = _make_agent_request(state["site"], start, end, state["pm_stats_dir"])
         rainfall, notes = _collect_rainfall(state["site"], start, end, req)
         state["rainfall_by_date"] = rainfall
         state["data_notes"].extend(notes)
 
         total_days = (end - start).days + 1
-        rainy_days = sum(1 for v in rainfall.values() if v > 0)
-        total_mm = sum(rainfall.values())
+        import pandas as pd
+        rain_vals = list(rainfall) if isinstance(rainfall, pd.Series) else list(rainfall.values())
+        rainy_days = sum(1 for v in rain_vals if v > 0)
+        total_mm = sum(rain_vals)
         return (
             f"강수량 수집 완료: {start} ~ {end} ({total_days}일), "
             f"강수일 {rainy_days}일, 총 강수량 {total_mm:.1f}mm. "
@@ -381,9 +380,7 @@ def run_llm_agent(
         start = date.fromisoformat(start_str) if start_str else (state["start_date"] or default_start)
         end = date.fromisoformat(end_str) if end_str else (state["end_date"] or default_end)
 
-        req = _make_agent_request(
-            state["site"], start, end, False, state["pm_stats_dir"]
-        )
+        req = _make_agent_request(state["site"], start, end, state["pm_stats_dir"])
         pm, notes = _collect_pm(state["site"], start, end, req)
         state["pm_by_date"] = pm
         state["data_notes"].extend(notes)
@@ -476,12 +473,44 @@ def run_llm_agent(
         )
 
     def _exec_evaluate_regional_characteristics(inp: dict) -> str:
-        # R1~R5(사용자 입력 site 특성) → F_site 계수 (반물리 모델에 반영)
         user_chars = state.get("regional_characteristics", {})
-        f_site, breakdown = fsite_from_characteristics(user_chars)
 
-        # R6~R7: AI 판정 (봄철 황사/강수세척) — 반물리 모델은 실측 PM·강수로
-        # 이 효과를 이미 내재 반영하므로 F_site에는 넣지 않고 '해석 맥락'으로만 사용
+        # 각 R1~R5마다: 사용자가 명시적으로 체크한 항목은 그 값 우선,
+        # 체크하지 않은 항목은 AI(inp)가 지역명·PM·강수 데이터 기반으로 판정.
+        _r_map = [
+            ("r1_agricultural", "r1_level"),
+            ("r2_industrial",   "r2_level"),
+            ("r3_traffic",      "r3_level"),
+            ("r4_coastal",      "r4_level"),
+            ("r5_tilt",         "r5_level"),
+        ]
+        chars_to_use: dict = {}
+        user_filled: list[str] = []
+        ai_filled: list[str] = []
+
+        for bool_key, level_key in _r_map:
+            if user_chars.get(bool_key):
+                chars_to_use[bool_key] = True
+                chars_to_use[level_key] = user_chars.get(level_key, "mid")
+                user_filled.append(bool_key)
+            else:
+                ai_val = bool(inp.get(bool_key, False))
+                chars_to_use[bool_key] = ai_val
+                chars_to_use[level_key] = inp.get(level_key, "low")
+                if ai_val:
+                    ai_filled.append(bool_key)
+
+        if not user_filled:
+            source_label = "AI 판정"
+        elif ai_filled:
+            source_label = "사용자 입력 + AI 보완"
+        else:
+            source_label = "사용자 입력"
+
+        state["regional_characteristics"] = chars_to_use
+        f_site, breakdown = fsite_from_characteristics(chars_to_use)
+
+        # R6~R7: AI 판정 — 실측 PM·강수가 이미 반영하므로 F_site엔 가산 안 함
         r6_level = inp.get("r6_dust_level", "low")
         r7_level = inp.get("r7_rainfall_level", "low")
 
@@ -490,23 +519,24 @@ def run_llm_agent(
             "breakdown": breakdown,
             "r6_dust_level": r6_level,
             "r7_rainfall_level": r7_level,
+            "source": source_label,
         }
 
         if breakdown:
-            lines = [
+            bd_lines = [
                 f"  {b['label']}: {b['level']} → F_site +{b['increment']:.2f}"
                 for b in breakdown
             ]
-            bd_text = "\n".join(lines)
+            bd_text = "\n".join(bd_lines)
         else:
-            bd_text = "  (선택된 지역특성 없음 → 일반 지역)"
+            bd_text = "  (해당 지역특성 없음 → 일반 지역)"
 
         return (
-            f"지역특성 평가 완료 (반물리 모델 F_site 계수):\n"
+            f"지역특성 평가 완료 ({source_label}, 반물리 모델 F_site 계수):\n"
             f"- 최종 F_site: {f_site:.2f} (일반=1.0, 산업/건조는 배수)\n"
-            f"- R1~R5 site 특성 내역:\n{bd_text}\n"
+            f"- R1~R5 특성 내역:\n{bd_text}\n"
             f"- R6 봄철황사 판정: {r6_level}, R7 강수세척 판정: {r7_level} "
-            f"(→ 실측 PM·강수로 모델에 내재 반영됨. F_site 별도 가산 안 함)\n"
+            f"(실측 PM·강수로 모델에 내재 반영. F_site 별도 가산 안 함)\n"
             f"- F_site는 학술 퇴적속도를 국내 실측 소일링으로 보정(DEPO_CAL=14)한 뒤 "
             f"지역계수로 곱해집니다. 절대값 확정에는 현장 보정 필요."
         )
@@ -520,12 +550,40 @@ def run_llm_agent(
         "evaluate_regional_characteristics": _exec_evaluate_regional_characteristics,
     }
 
-    # Build initial user message
+    # Build initial user message — include user's sidebar selections so LLM
+    # passes the correct values to evaluate_regional_characteristics.
     default_start, default_end = _default_period()
+
+    _level_kr = {"low": "저", "mid": "중", "high": "고"}
+    _char_labels = {
+        "r1": ("r1_agricultural", "r1_level", "농업지역"),
+        "r2": ("r2_industrial",   "r2_level", "산업/건설"),
+        "r3": ("r3_traffic",      "r3_level", "철도/도로"),
+        "r4": ("r4_coastal",      "r4_level", "해안"),
+        "r5": ("r5_tilt",         "r5_level", "저틸트"),
+    }
+    rc = regional_characteristics or {}
+    chars_parts = []
+    for _, (bool_key, level_key, label) in _char_labels.items():
+        if rc.get(bool_key):
+            lvl = rc.get(level_key, "mid")
+            chars_parts.append(f"{label}({_level_kr.get(lvl, lvl)})")
+    if chars_parts:
+        chars_desc = (
+            f" 사용자 선택 지역특성: {', '.join(chars_parts)}. "
+            f"evaluate_regional_characteristics 호출 시 위 R1~R5 값을 그대로 전달하세요."
+        )
+    else:
+        chars_desc = (
+            " 사용자가 지역특성을 선택하지 않았습니다. "
+            "evaluate_regional_characteristics 호출 시 AI가 지역명과 수집된 "
+            "PM·강수 데이터를 근거로 R1~R5를 직접 판정하여 입력하세요."
+        )
+
     user_message = (
         f"{region_name} 지역의 태양광 패널 세척 판단 분석을 수행해 주세요. "
         f"분석 기간: {default_start.isoformat()} ~ {default_end.isoformat()}, "
-        f"설비 용량: {capacity_kw:,.0f}kW, 상위 우선순위: {top_n}건."
+        f"설비 용량: {capacity_kw:,.0f}kW, 상위 우선순위: {top_n}건.{chars_desc}"
     )
 
     messages: list[dict] = [{"role": "user", "content": user_message}]

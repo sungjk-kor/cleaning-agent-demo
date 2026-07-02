@@ -569,7 +569,41 @@ if st.session_state.get("awaiting_run"):
             st.success(f"✅ AI 분석 완료. (오늘 사용: {st.session_state.llm_call_count}/{DAILY_LLM_LIMIT}회)")
         except Exception as exc:
             st.session_state.awaiting_run = False
-            st.exception(exc)
+
+            # 1) 예외 원인 체인 펼치기 (APIConnectionError는 실제 원인을 감쌈)
+            chain = []
+            cur = exc
+            for _ in range(6):
+                if cur is None:
+                    break
+                chain.append(f"{type(cur).__module__}.{type(cur).__name__}: {cur}")
+                cur = cur.__cause__ or cur.__context__
+            st.error(
+                "에이전트 실행 오류 — 원인 체인:\n\n"
+                + "\n\n".join(f"{idx + 1}. {msg}" for idx, msg in enumerate(chain))
+            )
+
+            # 2) Anthropic API 직접 연결 테스트 (SDK와 무관하게 네트워크/SSL 확인)
+            import httpx as _httpx
+            try:
+                probe = _httpx.get(
+                    "https://api.anthropic.com/v1/models",
+                    headers={
+                        "x-api-key": os.environ.get("ANTHROPIC_API_KEY", ""),
+                        "anthropic-version": "2023-06-01",
+                    },
+                    timeout=15.0,
+                )
+                st.info(
+                    f"직접 연결 테스트: HTTP {probe.status_code} "
+                    "(200=정상 · 401=키문제지만 연결됨 · 응답이 오면 네트워크는 정상)"
+                )
+            except Exception as probe_exc:
+                st.warning(
+                    f"직접 연결 테스트 실패: {type(probe_exc).__name__}: {probe_exc} "
+                    "→ 네트워크/SSL 레벨 문제"
+                )
+
             st.stop()
 
 elif run_quick:

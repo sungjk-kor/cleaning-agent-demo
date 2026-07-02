@@ -39,20 +39,19 @@ def require_email() -> bool:
     if submitted and email:
         try:
             if GSHEETS_ENABLED and conn is not None:
-                # Google Sheets에 이메일 저장
-                existing = conn.read(worksheet="leads", ttl=0)
+                # Google Sheets에 이메일 저장 (실제 탭 이름: soiling_loss_email_collect)
+                existing = conn.read(worksheet="soiling_loss_email_collect", ttl=0)
                 new_row = pd.DataFrame({
                     "timestamp": [datetime.now().isoformat()],
                     "email": [email],
-                    "region": [st.session_state.get("selected_region", "")],
                 })
                 updated = pd.concat([existing, new_row], ignore_index=True)
-                conn.update(worksheet="leads", data=updated)
+                conn.update(worksheet="soiling_loss_email_collect", data=updated)
             st.session_state.lead_email = email
             st.success(f"✅ {email}로 등록되었습니다!")
             st.rerun()
         except Exception as e:
-            st.error(f"등록 오류: {e}")
+            st.exception(e)  # 임시: 전체 traceback을 화면에 표시 (원인 확인 후 복원 예정)
             return False
     return False
 

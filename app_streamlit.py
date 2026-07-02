@@ -549,6 +549,7 @@ if run:
                 lookback_years=lookback_years,
                 capacity_kw=lcoe_inputs.capacity,
                 top_n=top_n,
+                model="claude-haiku-4-5-20251001",  # 비용 최적화: haiku 사용
                 regional_characteristics=regional_characteristics,
             )
             st.session_state["last_is_llm"] = True

@@ -346,7 +346,9 @@ def run_llm_agent(
 ) -> LLMAgentResult:
     """LLM tool-use 에이전트를 실행하여 세척 판단 리포트를 생성합니다."""
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    # .strip(): secrets/env에 앞뒤 공백·줄바꿈이 섞여 있으면 HTTP 헤더가
+    # "Illegal header value"로 거부되어 연결 자체가 실패한다. 방어적으로 제거.
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY 환경변수가 설정되지 않았습니다.")
 

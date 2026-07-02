@@ -339,7 +339,7 @@ def run_llm_agent(
     lookback_years: int = 1,
     capacity_kw: float = 1000.0,
     top_n: int = 5,
-    model: str = "claude-sonnet-4-6",
+    model: str = "claude-haiku-4-5-20251001",
     pm_stats_dir: str | None = None,
     regional_characteristics: dict | None = None,
 ) -> LLMAgentResult:
@@ -671,7 +671,7 @@ def run_llm_agent(
     while True:
         response = client.messages.create(
             model=model,
-            max_tokens=4096,
+            max_tokens=600,
             system=_SYSTEM_PROMPT,
             tools=TOOLS,
             messages=messages,

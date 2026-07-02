@@ -29,6 +29,30 @@ try:
 except Exception:
     pass
 
+# 일일 Claude 호출 한도 설정
+DAILY_LLM_LIMIT = 5
+
+
+def _check_daily_limit() -> tuple[bool, int, int]:
+    """세션별 일일 Claude 호출 한도 확인. (허용, 사용횟수, 한도)"""
+    today = date.today().isoformat()
+    if "llm_call_date" not in st.session_state:
+        st.session_state.llm_call_date = today
+        st.session_state.llm_call_count = 0
+
+    # 날짜가 바뀌었으면 초기화
+    if st.session_state.llm_call_date != today:
+        st.session_state.llm_call_date = today
+        st.session_state.llm_call_count = 0
+
+    allowed = st.session_state.llm_call_count < DAILY_LLM_LIMIT
+    return allowed, st.session_state.llm_call_count, DAILY_LLM_LIMIT
+
+
+def _increment_daily_count():
+    """Claude 호출 횟수 증가."""
+    st.session_state.llm_call_count += 1
+
 
 def _env_status(name: str) -> str:
     return "설정됨" if os.environ.get(name) else "없음"
@@ -455,6 +479,16 @@ section[data-testid="stSidebar"] hr {
 # ── Run logic ─────────────────────────────────────────────────────────────────
 
 if run:
+    # 일일 Claude 호출 한도 확인
+    allowed, used, limit = _check_daily_limit()
+    if not allowed:
+        st.error(
+            f"🚫 오늘 AI 분석 한도({limit}회)를 모두 사용했습니다. "
+            f"내일 다시 시도해 주세요. "
+            f"(현재: {used}/{limit}회 사용)"
+        )
+        st.stop()
+
     if not os.environ.get("ANTHROPIC_API_KEY"):
         st.error(
             "ANTHROPIC_API_KEY가 설정되지 않았습니다. "
@@ -474,6 +508,8 @@ if run:
                 regional_characteristics=regional_characteristics,
             )
             st.session_state["last_is_llm"] = True
+            _increment_daily_count()
+            st.success(f"✅ AI 분석 완료. (오늘 사용: {st.session_state.llm_call_count}/{DAILY_LLM_LIMIT}회)")
         except Exception as exc:
             st.error(f"에이전트 실행 오류: {exc}")
             st.stop()

@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-    에이전트 바꾸기 342행
 """
 agent_llm.py — LLM-driven cleaning decision agent using Anthropic tool use.
 Existing core tools are not modified — only wrapped with tool schemas.
@@ -11,6 +11,7 @@ from datetime import date
 from typing import Any
 
 import anthropic
+import httpx
 
 from .agent import (
     AgentRequest,
@@ -349,7 +350,10 @@ def run_llm_agent(
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY 환경변수가 설정되지 않았습니다.")
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = anthropic.Anthropic(
+        api_key=api_key,
+        timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=10.0),
+    )
 
     # Python-side state: full data lives here, LLM sees only summaries
     state: dict[str, Any] = {

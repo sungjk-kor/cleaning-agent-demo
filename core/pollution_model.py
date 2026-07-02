@@ -16,7 +16,11 @@ from dataclasses import asdict, dataclass
 from datetime import date, timedelta
 from typing import Literal, Mapping
 
-from .soiling_semiphysical import run_semiphysical_model
+from .soiling_semiphysical import (
+    SoilingScenarioRange,
+    run_semiphysical_model,
+    run_soiling_scenarios,
+)
 
 
 @dataclass
@@ -250,28 +254,33 @@ def simulate_cleaning_decision(
     regional_weight_ppt: float = 0.0,  # (구) 가산식 — 신모델에서는 미사용, 호환 유지
     model_name: str = "semiphysical",
     f_site: float = 1.0,
+    residual_info: dict | None = None,
+    scenario: str = "conservative",
 ) -> PollutionModelResult:
     """
-    반물리 5단계 소일링 모델로 연손실과 세척 우선순위 산출.
+    강우사건 기반 반물리 소일링 모델로 연손실과 세척 우선순위 산출.
 
-    최종 손실 = 반물리 모델(F_site 적용)
+    대표값(LCOE·우선순위)은 보수(conservative) 시나리오 기준.
     audit 분리: base = F_site 1.0(PM/강수 기반), regional = F_site 효과 증가분
 
     Args:
         rainfall_by_date: pd.Series(hourly, DatetimeIndex) 권장 | dict[date: mm]
         f_site: 지역특성 계수 (1.0=일반, 산업/건조는 배수). 지역특성에서 매핑됨.
-        model_name: "semiphysical" (반물리 5단계, IEA 보고서 기반)
+        residual_info: {"nonseasonal","spring"} 세척효율 약화 잔류.
+        scenario: "conservative"(대표) | "relaxed"
     """
     # 전체 손실 (실제 F_site 적용)
     total_result = run_semiphysical_model(
-        rainfall_by_date, pm_by_date, start, end, f_site_override=f_site
+        rainfall_by_date, pm_by_date, start, end, f_site_override=f_site,
+        residual_info=residual_info, scenario=scenario,
     )
     # 기저 손실 (F_site=1, PM/강수만) — audit 분리용
     if abs(f_site - 1.0) < 1e-9:
         base_result = total_result
     else:
         base_result = run_semiphysical_model(
-            rainfall_by_date, pm_by_date, start, end, f_site_override=1.0
+            rainfall_by_date, pm_by_date, start, end, f_site_override=1.0,
+            residual_info=residual_info, scenario=scenario,
         )
     base_by_date = {item["date"]: item["loss_pct"] for item in base_result.daily}
 

@@ -138,6 +138,44 @@ def _priority_frame(result) -> pd.DataFrame:
     )
 
 
+def _render_soiling_audit(sr) -> None:
+    """완화/보수 시나리오 audit 표 + 기상분석 통계 (항상 표시)."""
+    if sr is None:
+        return
+
+    def _row(label, cond, r):
+        return {
+            "시나리오": label,
+            "조건": cond,
+            "연평균%": f"{r.annual_loss_pct:.2f}",
+            "봄철평균%": f"{r.spring_loss_pct:.2f}" if r.spring_loss_pct is not None else "-",
+            "봄철피크%": f"{r.spring_peak_loss_pct:.2f}" if r.spring_peak_loss_pct is not None else "-",
+            "유효세척(회)": r.effective_wash_count,
+            "최대무세척(일)": r.max_no_wash_days,
+        }
+
+    rel, con = sr.relaxed, sr.conservative
+    rows = [
+        _row("완화(relaxed)", "10~20mm 부분세척 인정", rel),
+        _row("보수(conservative)", "≥20mm만 유효세척", con),
+    ]
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # 기상데이터 분석 요약
+    c1, c2, c3 = st.columns(3)
+    c1.metric("강우사건 수", f"{con.rain_event_count}회")
+    c2.metric("최대 무세척(보수)", f"{con.max_no_wash_days}일",
+              f"{con.max_no_wash_month}월경" if con.max_no_wash_month else None)
+    c3.metric("유효세척 완화→보수", f"{rel.effective_wash_count}→{con.effective_wash_count}회")
+    st.caption(
+        f"F_site={sr.f_site:g}, 잔류 비계절 {sr.residual_info.get('nonseasonal', 0):.2f}·"
+        f"봄철 {sr.residual_info.get('spring', 0):.2f}. "
+        "완화→보수는 10~20mm 강우를 유효세척으로 인정하지 않아 손실↑. 봄철 피크는 PM·꽃가루·"
+        "철새 잔류로 세척효율이 저하되어 연평균을 상회. **모든 값은 단일연도 모델 산출값이며, "
+        "절대값 확정에는 실측 소일링 센서 보정이 필요**합니다(장기평균은 10~30년 반복계산 필요)."
+    )
+
+
 @st.dialog("분석 보고서", width="large")
 def _show_report_dialog(report_markdown: str) -> None:
     st.markdown(report_markdown)
@@ -298,7 +336,27 @@ with st.sidebar:
         else:
             regional_characteristics["r5_tilt"] = False
 
-        st.caption("※ R6(봄철 황사), R7(강수세척)은 AI가 PM·강수 데이터를 보고 판정합니다.")
+        col1, col2 = st.columns([1.5, 1])
+        with col1:
+            r6_org = st.checkbox("생물오염(새·꽃가루·조류)", value=False, key="r6_org")
+        if r6_org:
+            with col2:
+                regional_characteristics["r6_organic"] = True
+                regional_characteristics["r6_organic_level"] = st.selectbox("강도", ["low", "mid", "high"], format_func=lambda x: {"low":"저", "mid":"중", "high":"고"}[x], key="r6_organic_level")
+        else:
+            regional_characteristics["r6_organic"] = False
+
+        col1, col2 = st.columns([1.5, 1])
+        with col1:
+            r_bird = st.checkbox("철새도래지 인접(천수만 등)", value=False, key="r_bird")
+        if r_bird:
+            with col2:
+                regional_characteristics["bird_adjacent"] = True
+                regional_characteristics["bird_level"] = st.selectbox("강도", ["low", "mid", "high"], format_func=lambda x: {"low":"저", "mid":"중", "high":"고"}[x], key="bird_level")
+        else:
+            regional_characteristics["bird_adjacent"] = False
+
+        st.caption("※ 봄철 황사·강수세척은 AI가 PM·강수 데이터를 보고 판정합니다.")
 
     st.divider()
     st.write("")
@@ -438,7 +496,7 @@ elif run_quick:
             + "\n\n".join(f"- {m}" for m in missing_msgs)
         )
 
-    f_site_val, _ = fsite_from_characteristics(regional_characteristics)
+    f_site_val, residual_info, _ = fsite_from_characteristics(regional_characteristics)
     request = AgentRequest(
         region_name=final_region,
         region1=region1,
@@ -448,6 +506,7 @@ elif run_quick:
         end_date=end_date,
         lookback_years=lookback_years,
         f_site=f_site_val,
+        residual_info=residual_info,
         top_n=top_n,
         lcoe_inputs=lcoe_inputs,
     )
@@ -472,64 +531,83 @@ if result.pollution is not None and result.lcoe is not None and result.site is n
     daily_df = _daily_frame(result)
     priority_df = _priority_frame(result)
 
+    sr = getattr(result, "soiling_range", None)
+
+    # 헤드라인: 단일값이 아닌 완화~보수 시나리오 range + 봄철 피크
+    if sr is not None:
+        st.markdown(
+            f"## 🎯 연손실 {sr.low_pct:.1f} ~ {sr.high_pct:.1f}% "
+            f"(완화~보수) · 봄철 피크 {sr.spring_peak_pct:.1f}%"
+        )
+        st.caption(
+            f"완화 {sr.low_pct:.1f}%(10~20mm 부분세척 인정) ~ 보수 {sr.high_pct:.1f}%(≥20mm만 유효세척) · "
+            f"봄철 피크 {sr.spring_peak_pct:.1f}%는 **실측 소일링 센서 보정 전 시나리오값**"
+        )
+
     metric_cols = st.columns(4)
-    metric_cols[0].metric("연평균 오염 손실", f"{result.pollution.annual_pollution_loss_pct:.2f}%")
+    if sr is not None:
+        metric_cols[0].metric("연손실 range", f"{sr.low_pct:.1f}~{sr.high_pct:.1f}%", f"봄철피크 {sr.spring_peak_pct:.1f}%")
+    else:
+        metric_cols[0].metric("연평균 오염 손실", f"{result.pollution.annual_pollution_loss_pct:.2f}%")
     metric_cols[1].metric("연간 발전량 손실", f"{result.pollution.annual_generation_loss_kwh:,.0f} kWh")
     metric_cols[2].metric("반영 후 LCOE", f"{result.lcoe.ref_lcoe:.2f} 원/kWh", f"+{result.lcoe.lcoe_increase:.2f}%")
     metric_cols[3].metric("분석 지점", result.site.name)
 
+    # 완화~보수 시나리오 audit 표 + 기상분석 (항상 표시)
+    if sr is not None:
+        st.markdown("#### 시나리오 근거 (완화 vs 보수)")
+        _render_soiling_audit(sr)
+
     # 반물리 5단계 모델 산출식 및 출처
-    with st.expander("📐 반물리 5단계 소일링 모델 산출식 및 출처", expanded=False):
+    with st.expander("📐 강우사건 기반 소일링·세척 모델 산출식 및 출처", expanded=False):
         st.markdown(r"""
-### 반물리 5단계 소일링 모델 (IEA PVPS / Coello-Boyle 계열)
+### 강우사건(R_e) 기반 반물리 소일링·세척 모델 (IEA PVPS / Coello-Boyle 계열)
 
-대기 PM → 표면 퇴적 → 강우 세정 → 누적 → 비선형 발전손실의 5단계 물리 모델.
+대기 PM → 표면 퇴적 → 강우사건 단계세척 → 누적 → 비선형 발전손실.
 
-**1단계 — 미세/조대입자 분리** (PM10에 PM2.5 중복 제거)
+**1단계 — 미세/조대입자 분리**
 ```
 PM_coarse = max(PM10 − PM2.5, 0)
 ```
 
-**2단계 — 일 퇴적량** (g/m²/day)
+**2단계 — 일 퇴적량** (g/m²/day, 일<5mm면 ×1.2 가중)
 ```
-Δm = 0.0864 · cosθ · (v_f·PM2.5 + v_c·PM_coarse) · F_site
+Δm = 0.0864 · cosθ · (v_f·PM2.5 + v_c·PM_coarse) · F_site · DEPO_CAL
 ```
-- v_f=0.0009, v_c=0.004 m/s (PM2.5/조대 유효 퇴적속도)
-- DEPO_CAL=14 (학술 퇴적속도 → 국내 실측 소일링 보정)
-- F_site: 지역특성 계수 (일반=1.0, 산업/건조는 배수)
+- v_f=0.0009, v_c=0.004 m/s, DEPO_CAL=1.0 (미보정, 학술 퇴적속도 그대로)
+- F_site: 지역특성 계수 (일반=1.0, 산업/해안/철새/생물오염은 배수)
 
-**3단계 — 강우 세정률**
+**3단계 — 강우사건(R_e) 단계세척** (사건 종료 시 1회)
 ```
-η_rain = 0                          (R < R0)
-       = η_max·[1 − exp(−k_R·(R−R0))]  (R ≥ R0)
-```
-- η_max=0.8, R0=2.5mm, k_R=0.3
-
-**4단계 — 누적 먼지량 (재비산 반영)**
-```
-m⁻ = max(0, m_{d-1} + Δm − ρ·m_{d-1})
-m  = m⁻ · (1 − η_rain) · (1 − η_manual)
+사건 분리: 무강우 6h↑ → 다음 사건.  R_e = 사건 강수합
+R_e < 10mm         → η_weak    = 0.05
+10 ≤ R_e < 20mm    → 완화 0.55 / 보수 0.05
+R_e ≥ 20mm         → η_strong  = 0.85
+η_eff = η_tier · (1 − residual)   (완전초기화 금지)
+residual = min(0.60, 0.15 + 철새·염분·도로 + 봄철 꽃가루)
 ```
 
-**5단계 — 비선형 발전손실**
+**4단계 — 누적**
 ```
-SR = exp(−κ·m^γ),   SL = 1 − SR
+M_before = M_{d-1} + Δm
+M_after  = M_before · (1 − η_eff)   (사건 종료일에만 세척)
 ```
-- κ=0.0416 (PDF: 먼지 10g/m² → 34% 손실 기준), γ=1.0
 
-**연손실** = mean(SL) × 100
+**5단계 — 비선형 발전손실 (세척 직전 질량 기준)**
+```
+SL = 1 − exp(−κ·M_before^γ),  κ=0.0416, γ=1.0
+```
+
+**두 시나리오 range**: 완화(10~20mm 부분세척 인정) ~ 보수(≥20mm만 유효세척),
+헤드라인 = "연 완화~보수%, 봄철 피크 X%".
 
 **참고 보고서:**
-1. **IEA PVPS T13-21:2022** — *Soiling Losses – Impact on the Performance of
-   Photovoltaic Power Plants* (2022)
-2. **Systematic review of soiling mitigation strategies for solar photovoltaic
-   panels** (2026)
+1. **IEA PVPS T13-21:2022** — *Soiling Losses – Impact on the Performance of PV Plants*
+2. Coello, C. & Boyle, L. (2019), *IEEE J. Photovoltaics* 9(5):1382-1387
 
-**모델 원출처:**
-- Coello, C. & Boyle, L. (2019), *IEEE J. Photovoltaics* 9(5):1382-1387
-
-**검증(서산 2025):** 일반 3.4% / 산업 6.5% / 건조농업 8.0% / 극심 9.4%
-→ IEA 세계평균 3~5%, 산업·건조 ~10% 범위 부합
+**보정 상태:** DEPO_CAL=1.0(미보정). 특정 목표 %에 맞춘 역산은 하지 않으며, 절대값
+확정에는 **실측 소일링 센서 보정이 필요**합니다(field-calibration pending). 단일연도
+산출값이며 장기평균은 10년(최소)~30년(기후평년) 반복계산이 필요합니다.
         """)
 
     left, right = st.columns([1.2, 0.8], gap="large")
@@ -576,27 +654,38 @@ SR = exp(−κ·m^γ),   SL = 1 − SR
     if getattr(result, "f_site_info", None) is not None:
         info = result.f_site_info
         source_label = info.get("source", "사용자 입력")
-        with st.expander(f"🌍 지역특성 분석 (F_site) — {source_label}"):
-            st.markdown(f"**최종 F_site: {info['f_site']:.2f}** (일반=1.0, 산업/건조는 배수)")
+        resid = info.get("residual_info") or {}
+        with st.expander(f"🌍 부지 가중요인 (F_site·잔류) — {source_label}"):
+            st.markdown(
+                f"**최종 F_site: {info['f_site']:.2f}** · "
+                f"세척효율 약화 잔류: 비계절 +{resid.get('nonseasonal', 0):.2f}, "
+                f"봄철 +{resid.get('spring', 0):.2f} (base 0.15와 합산, 상한 0.60)"
+            )
 
             level_kr = {"low": "저", "mid": "중", "high": "고"}
             breakdown_data = []
             for b in info.get("breakdown", []):
+                res_txt = []
+                if b.get("res_nonseasonal"):
+                    res_txt.append(f"잔류+{b['res_nonseasonal']:.2f}")
+                if b.get("res_spring"):
+                    res_txt.append(f"봄철잔류+{b['res_spring']:.2f}")
                 breakdown_data.append({
-                    "지역요인": b["label"],
+                    "부지요인": b["label"],
                     "강도": level_kr.get(b["level"], b["level"]),
                     "F_site 증분": f"+{b['increment']:.2f}",
-                    "출처": source_label,
+                    "잔류 증분": ", ".join(res_txt) or "-",
+                    "출처": b.get("source", "-"),
                 })
             if breakdown_data:
                 breakdown_df = pd.DataFrame(breakdown_data)
                 st.dataframe(breakdown_df, use_container_width=True, hide_index=True)
             else:
-                st.caption("해당 지역특성 없음 → 일반 지역(F_site=1.0)")
+                st.caption("해당 부지 가중요인 없음 → 일반 지역(F_site=1.0)")
 
             st.caption(
-                f"R6 봄철황사 판정: {level_kr.get(info.get('r6_dust_level'), '-')}, "
-                f"R7 강수세척 판정: {level_kr.get(info.get('r7_rainfall_level'), '-')} "
+                f"봄철 황사 판정: {level_kr.get(info.get('r6_dust_level'), '-')}, "
+                f"강수세척 판정: {level_kr.get(info.get('r7_rainfall_level'), '-')} "
                 "— 실측 PM·강수로 모델에 내재 반영 (F_site 별도 가산 없음)"
             )
 

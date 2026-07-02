@@ -153,6 +153,97 @@ def load_asos_daily_precip(
     return result
 
 
+def load_asos_daily_insolation(
+    csv_path: Path | str, year: int | None = None
+) -> dict[str, dict[date, float]]:
+    """
+    ASOS 시간별 CSV → 지점별 일일 일사량(MJ/m²/day) 테이블.
+
+    일사(MJ/m2) 칼럼(시간 단위)을 일별로 합산. Tier3(일사량 우수) 시나리오에서
+    소일링 손실의 일사 가중에 사용.
+
+    Returns:
+        {station_code: {date: MJ/m²/day, ...}, ...}
+    """
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"ASOS CSV not found: {csv_path}")
+
+    df = pd.read_csv(csv_path, encoding="cp949", dtype={"지점": str}, low_memory=False)
+
+    insol_col = "일사(MJ/m2)"
+    required = {"지점", "일시", insol_col}
+    if not required.issubset(df.columns):
+        raise ValueError(f"Missing columns in {csv_path.name}. Need: {required}")
+
+    try:
+        df["datetime"] = pd.to_datetime(df["일시"], format="%Y-%m-%d %H:%M")
+    except Exception as e:
+        raise ValueError(f"Failed to parse '일시' column in {csv_path.name}: {e}")
+
+    # 일사량 결측(NaN)·QC=9 → 0 (일별 합산 기준)
+    df[insol_col] = pd.to_numeric(df[insol_col], errors="coerce").fillna(0.0)
+    if "일사 QC플래그" in df.columns:
+        qc = pd.to_numeric(df["일사 QC플래그"], errors="coerce").fillna(0).astype(int)
+        df.loc[qc == 9, insol_col] = 0.0
+
+    df["date"] = df["datetime"].dt.date
+
+    result: dict[str, dict[date, float]] = {}
+    for station_code, group in df.groupby("지점", sort=False):
+        daily_insol: dict[date, float] = {}
+        for d, day_group in group.groupby("date"):
+            daily_insol[d] = round(float(day_group[insol_col].sum()), 3)
+        result[station_code] = daily_insol
+    return result
+
+
+def load_asos_insolation_range(
+    start_year: int, end_year: int, data_dir: Path | str | None = None
+) -> dict[str, dict[date, float]]:
+    """
+    여러 년도의 ASOS 일사량(일별 합산)을 로드 & 병합.
+
+    Returns:
+        {station_code: {date: MJ/m²/day, ...}, ...}
+    """
+    files = list_asos_files(data_dir)
+    combined: dict[str, dict[date, float]] = {}
+
+    for fpath in files:
+        match = re.search(r"(\d{4})", fpath.name)
+        if not match:
+            continue
+        year = int(match.group(1))
+        if not (start_year <= year <= end_year):
+            continue
+        try:
+            station_data = load_asos_daily_insolation(fpath, year)
+            for station_code, daily in station_data.items():
+                combined.setdefault(station_code, {}).update(daily)
+        except Exception as e:
+            print(f"⚠️  {fpath.name} 일사량 처리 실패: {e}")
+            continue
+
+    return combined
+
+
+def get_region_daily_insolation(
+    station_data: dict[str, dict[date, float]],
+    lat: float,
+    lon: float,
+    exclude_codes: list[str] | None = None,
+) -> dict[date, float]:
+    """
+    지역(위경도)에 할당된 ASOS 지점의 일별 일사량(MJ/m²/day).
+
+    Returns:
+        {date: MJ/m²/day, ...}
+    """
+    nearest_code, _dist = assign_nearest_station(lat, lon, exclude_codes)
+    return station_data.get(nearest_code, {})
+
+
 def list_asos_files(data_dir: Path | str | None = None) -> list[Path]:
     """ASOS CSV 파일 목록 (연도순)."""
     root = Path(data_dir) if data_dir else ASOS_DATA_DIR

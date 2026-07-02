@@ -74,12 +74,14 @@ PM split → daily deposition → rain cleaning → accumulation → nonlinear l
 | Stage | What it does |
 |-------|--------------|
 | **1. PM split** | `PM_coarse = max(PM10 − PM2.5, 0)` — coarse and fine settle at different rates |
-| **2. Deposition** | `Δm = 0.0864·cosθ·(v_f·PM2.5 + v_c·PM_coarse)·F_site`  [g/m²/day] |
-| **3. Rain cleaning** | `η_rain = η_max·[1 − exp(−k_R·(R − R0))]` above an effective threshold `R0` |
-| **4. Accumulation** | running dust mass with optional wind resuspension, reset by cleaning events |
-| **5. Nonlinear loss** | `SL = 1 − exp(−κ·mᵞ)` — loss saturates at high dust mass (10 g/m² ≈ 34%) |
+| **2. Deposition** | `Δm = 0.0864·cosθ·(v_f·PM2.5 + v_c·PM_coarse)·F_site·DEPO_CAL`  [g/m²/day]; low-rain days (<5 mm) get a +20% soiling weight |
+| **3. Rain-event cleaning** | hourly rain is grouped into **events** (≥6 h dry gap → new event); each event's total `R_e` drives a **tiered** wash at event end: `<10 mm → 0.05`, `10–20 mm → 0.55 (relaxed) / 0.05 (conservative)`, `≥20 mm → 0.85` |
+| **4. Residual weakening** | `η_eff = η_tier·(1 − residual)` — no full reset; `residual = min(0.60, 0.15 + bird/salt/road + spring pollen)` |
+| **5. Nonlinear loss** | `SL = 1 − exp(−κ·M_beforeᵞ)` on pre-wash mass — saturates at high dust (10 g/m² ≈ 34%) |
 
-Annual loss is the (insolation-weightable) mean of daily `SL`. Two calibration constants carry the uncertainty the reports flag explicitly: a **global deposition calibration** (`DEPO_CAL`, academic velocities → Korean field soiling rates) and the **regional factor `F_site`**.
+Two knobs carry the uncertainty the reports flag explicitly: a **global deposition scalar** (`DEPO_CAL`, default **1.0 = uncalibrated / academic velocities as-is**) and the **regional factor `F_site`** (plus a `residual` washing-efficiency term). Neither is tuned to hit a target percentage — `DEPO_CAL` stays at 1.0 until real soiling-sensor data is available (**field-calibration pending**).
+
+Because the absolute number is uncalibrated, the app **does not report a single point estimate**. It reports a **relaxed~conservative scenario range** — the two differ only in whether 10–20 mm rain events count as effective cleaning — plus the **spring peak**. The headline reads *"연 [relaxed]~[conservative]%, 봄철 피크 X%"*, and the upper end is always labeled a *pre-sensor-calibration scenario value*. A single year is one sample; long-run means need 10–30 years of repeated runs.
 
 ### `F_site` — the regional judgment layer
 
@@ -92,7 +94,7 @@ The decision to ground judgments in IEA authority rather than my own 25 years of
 - Coarse clay / cement / ash particles adhere strongly; hygroscopic salts promote **caking** in humid / coastal sites.
 - The **~10% loss in humid-region case studies** shows how badly a PM-only assumption can miss.
 
-**Validation (Seosan, 2025 — real PM + ASOS rainfall):** general 3.4% / industrial 6.5% / heavy-pollution 9.4% — matching IEA's **3–5% world average** and **up to ~10%** for industrial / dry sites. This falls out of the physics + one deposition calibration, not curve-fitting to a target.
+**Honest baseline (Seosan, 2025 — real PM + ASOS hourly rain):** with `F_site=1` / `DEPO_CAL=1.0` the annual loss is **well under 1%/yr** (relaxed ≈ 0.4%, conservative ≈ 0.5%), while the **spring peak** climbs toward ~1.6% and rises further once local-source `F_site` and washing-efficiency `residual` are applied (industrial + bird + coastal → spring peak ~5%). This is consistent with the view that Korea's PM-driven *absolute* soiling is low in a ~1,300 mm/yr climate, but that **washing efficiency, not rain totals, governs the peaks**. These are **illustrative scenarios pending sensor calibration**, not validated absolute losses — the honest use of the tool is relative ranking, peak-timing, and the *shape* of the range.
 
 ---
 
@@ -151,16 +153,17 @@ cleaning-agent-demo/
 
 **Working today**
 - LLM agent with tool-use loop and a transparent, auditable reasoning trace
-- **Semi-physical 5-stage soiling model** (IEA T13-21:2022 / Coello–Boyle), validated at 3–5% for general sites and up to ~10% for industrial/dry sites
-- **`F_site` regional layer** — sidebar characteristics → deposition multiplier, IEA-grounded
-- **ASOS hourly rainfall** integration (nearest-station by Haversine) feeding the cleaning term
+- **Rain-event (R_e) soiling & cleaning model** (IEA T13-21:2022 / Coello–Boyle), run **uncalibrated** (`DEPO_CAL=1.0`) — field-calibration pending
+- **`F_site` + `residual` site layer** — sidebar characteristics (industrial, coastal/salt, pollen, **bird-sanctuary adjacency**, low-tilt, bio-soiling) → deposition multiplier *and* washing-efficiency weakening, each with a cited source
+- **Relaxed~conservative scenario range** — the two differ on whether 10–20 mm events count as effective washing — plus spring peak; upper bound labeled a pre-calibration scenario value
+- **ASOS hourly rainfall** integration (nearest-station by Haversine) driving event detection
+- Weather-analysis report section — rain-event count, effective-wash count, max no-wash streak & month, PM seasonality
 - LCOE / economic-impact engine (numerically verified against the production TS version)
-- KMA rainfall fetcher (coordinate-based, no grid conversion)
 
 **In progress**
 - AirKorea nearest-station lookup by coordinates → PM10/PM2.5
 - Geocoding (place name / map click → lat/lon)
-- Field calibration of the model constants (κ, γ, v_f, v_c, R0) against reference-cell / soiling-sensor data
+- **Field calibration** of `DEPO_CAL`, `F_site`/`residual`, and the model constants (κ, γ, v_f, v_c, T1/T2, η tiers) against reference-cell / soiling-sensor data; multi-year (10–30 yr) climatology runs — until then, absolute values are single-year scenario estimates only
 
 This is a **demo, not a product**. It is intentionally separate from VigilAI's production infrastructure (React/TypeScript portal on AWS S3/CloudFront, ap-northeast-2).
 

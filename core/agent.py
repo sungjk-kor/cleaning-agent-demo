@@ -20,11 +20,20 @@ from typing import Any
 import os
 
 from .airkorea_pm import daily_pm_average, demo_pm_observations, normalize_sido
-from .asos_rainfall import get_region_daily_precip, get_region_hourly_precip, load_asos_range
+from .asos_rainfall import (
+    get_region_daily_precip,
+    get_region_hourly_precip,
+    load_asos_range,
+)
 from .kma_weather import daily_rainfall_mm, fetch_kma_surface
 from .lcoe import DEFAULT_INPUTS, LcoeInputs, calculate_lcoe
 from .pm_statistics import list_pm_stat_files, load_daily_pm_statistics, pm_stats_dir
-from .pollution_model import PollutionModelResult, simulate_cleaning_decision
+from .pollution_model import (
+    PollutionModelResult,
+    SoilingScenarioRange,
+    run_soiling_scenarios,
+    simulate_cleaning_decision,
+)
 
 
 @dataclass
@@ -48,6 +57,7 @@ class AgentRequest:
     lookback_years: int | None = 1
     lookback_days: int = 365
     f_site: float = 1.0  # 지역특성 계수 (1.0=일반, 산업/건조는 배수)
+    residual_info: dict | None = None  # {"nonseasonal","spring"} 세척효율 약화 잔류
     pm_stats_dir: str | None = None
     top_n: int = 5
     lcoe_inputs: LcoeInputs = field(default_factory=lambda: replace(DEFAULT_INPUTS))
@@ -64,6 +74,7 @@ class AgentResult:
     pollution: PollutionModelResult
     lcoe: Any
     report_markdown: str
+    soiling_range: SoilingScenarioRange | None = None
 
     def to_dict(self) -> dict:
         return _jsonable(asdict(self))
@@ -335,8 +346,20 @@ def run_cleaning_agent(req: AgentRequest) -> AgentResult:
         capacity_kw=lcoe_base_inputs.capacity,
         util_rate_pct=lcoe_base_inputs.util_rate,
         top_n=req.top_n,
-        model_name="semiphysical",  # 반물리 5단계 모델 (IEA 보고서 기반)
+        model_name="semiphysical",  # 강우사건 기반 반물리 모델 (보수 시나리오)
         f_site=req.f_site,
+        residual_info=req.residual_info,
+        scenario="conservative",
+    )
+
+    # 완화~보수 두 시나리오 range (헤드라인 = 연 완화~보수%, 봄철 피크)
+    soiling_range = run_soiling_scenarios(
+        rainfall_input=rainfall_by_date,
+        pm_by_date=pm_by_date,
+        start=start,
+        end=end,
+        f_site=req.f_site,
+        residual_info=req.residual_info,
     )
 
     lcoe_inputs = replace(
@@ -345,7 +368,7 @@ def run_cleaning_agent(req: AgentRequest) -> AgentResult:
     )
     lcoe_result = calculate_lcoe(lcoe_inputs)
 
-    report = build_report(site, start, end, pollution, lcoe_result)
+    report = build_report(site, start, end, pollution, lcoe_result, soiling_range)
     return AgentResult(
         site=site,
         start_date=start,
@@ -356,15 +379,40 @@ def run_cleaning_agent(req: AgentRequest) -> AgentResult:
         pollution=pollution,
         lcoe=lcoe_result,
         report_markdown=report,
+        soiling_range=soiling_range,
     )
 
 
-def build_report(site: Site, start: date, end: date, pollution: PollutionModelResult, lcoe_result: Any) -> str:
+def build_report(
+    site: Site,
+    start: date,
+    end: date,
+    pollution: PollutionModelResult,
+    lcoe_result: Any,
+    soiling_range: SoilingScenarioRange | None = None,
+) -> str:
     """Build a concise Korean report for the web app and API."""
     lines = [
         f"### {site.name} 청소 판단 리포트",
         f"- 분석 기간: {start.isoformat()} ~ {end.isoformat()}",
-        f"- 연평균 오염 손실률 추정: {pollution.annual_pollution_loss_pct:.2f}%",
+    ]
+    if soiling_range is not None:
+        c = soiling_range.conservative
+        r = soiling_range.relaxed
+        lines.append(
+            f"- 연손실 range: **{soiling_range.low_pct:.1f} ~ {soiling_range.high_pct:.1f}%** "
+            f"(완화~보수), 봄철 피크 **{soiling_range.spring_peak_pct:.1f}%** "
+            f"(실측 센서 보정 전 시나리오값)"
+        )
+        lines.append(
+            f"  - 완화(10~20mm 부분세척 인정): 연 {r.annual_loss_pct:.2f}% "
+            f"/ 유효세척 {r.effective_wash_count}회"
+        )
+        lines.append(
+            f"  - 보수(≥20mm만 유효세척): 연 {c.annual_loss_pct:.2f}% "
+            f"/ 유효세척 {c.effective_wash_count}회 / 최대 무세척 {c.max_no_wash_days}일"
+        )
+    lines += [
         f"- 연간 발전량 감소 추정: {pollution.annual_generation_loss_kwh:,.0f} kWh",
         f"- LCOE 영향: {lcoe_result.base_lcoe:.2f} → {lcoe_result.ref_lcoe:.2f} 원/kWh (+{lcoe_result.lcoe_increase:.2f}%)",
         "",

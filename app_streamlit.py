@@ -55,17 +55,6 @@ def require_email() -> bool:
             st.error(f"등록 오류: {e}")
             return False
     return False
-    msg = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=600,
-            messages=[{"role": "user", "content": f"다음 결과를 설명해줘: {result}"}],
-        )
-    st.write(msg.content[0].text)
-
-
-
-
-## 여기까지 스트림릿 배포 연결
 
 
 st.set_page_config(

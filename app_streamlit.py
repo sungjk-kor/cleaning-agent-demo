@@ -569,7 +569,7 @@ if st.session_state.get("awaiting_run"):
             st.success(f"✅ AI 분석 완료. (오늘 사용: {st.session_state.llm_call_count}/{DAILY_LLM_LIMIT}회)")
         except Exception as exc:
             st.session_state.awaiting_run = False
-            st.error(f"에이전트 실행 오류: {exc}")
+            st.exception(exc)
             st.stop()
 
 elif run_quick:

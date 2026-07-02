@@ -519,13 +519,22 @@ section[data-testid="stSidebar"] hr {
 # ── Run logic ─────────────────────────────────────────────────────────────────
 
 if run:
+    # 버튼 클릭 → 세션에 저장. 이메일 폼 제출처럼 다른 위젯이 만드는
+    # 리런에서도 이 값이 살아있어야, 폼 제출 후 곧바로 이전 화면으로
+    # 되돌아가지 않고 이어서 분석까지 진행됩니다.
+    st.session_state.awaiting_run = True
+
+if st.session_state.get("awaiting_run"):
     # 이메일 등록 확인
     if not require_email():
+        # 아직 이메일을 등록하지 않음 → awaiting_run은 True로 유지해서
+        # 폼 제출 후 리런 시 이 블록에 다시 들어오게 한다.
         st.stop()
 
     # 일일 Claude 호출 한도 확인
     allowed, used, limit = _check_daily_limit()
     if not allowed:
+        st.session_state.awaiting_run = False
         st.error(
             f"🚫 오늘 AI 분석 한도({limit}회)를 모두 사용했습니다. "
             f"내일 다시 시도해 주세요. "
@@ -534,6 +543,7 @@ if run:
         st.stop()
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
+        st.session_state.awaiting_run = False
         st.error(
             "ANTHROPIC_API_KEY가 설정되지 않았습니다. "
             ".env 파일 또는 Streamlit Secrets를 확인하세요."
@@ -554,8 +564,12 @@ if run:
             )
             st.session_state["last_is_llm"] = True
             _increment_daily_count()
+            # 완료 후 플래그 해제 — 다른 위젯(지역 선택 등) 조작으로
+            # 생기는 리런에서 Claude가 재호출되는 것을 막는다 (비용 방어).
+            st.session_state.awaiting_run = False
             st.success(f"✅ AI 분석 완료. (오늘 사용: {st.session_state.llm_call_count}/{DAILY_LLM_LIMIT}회)")
         except Exception as exc:
+            st.session_state.awaiting_run = False
             st.error(f"에이전트 실행 오류: {exc}")
             st.stop()
 

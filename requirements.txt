@@ -1,8 +1,9 @@
-streamlit>=1.35
-pandas>=2.0
-openpyxl>=3.1
-requests>=2.31
-python-dotenv>=1.0
+streamlit>=1.35,<2.0
+pandas>=2.0,<3.0
+openpyxl>=3.1,<4.0
+requests>=2.31,<3.0
+python-dotenv>=1.0,<2.0
 anthropic>=0.30
-pyarrow>=14
-pvlib>=0.10
+pyarrow>=14,<15
+pvlib>=0.10,<1.0
+st-gsheets-connection>=0.1

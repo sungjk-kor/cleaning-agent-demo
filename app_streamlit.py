@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import asdict, replace
-from datetime import date
+from datetime import date, datetime
 
 import pandas as pd
 import streamlit as st
@@ -15,6 +15,57 @@ from core.pm_statistics import (
     RegionPair, available_years, list_pm_stat_files, list_region_pairs,
     pm_stats_dir, pm_cache_status, precompute_pm_cache,
 )
+
+# Google Sheets 연동 (선택사항)
+try:
+    from streamlit_gsheets import GSheetsConnection
+    GSHEETS_ENABLED = True
+    conn = st.connection("gsheets", type=GSheetsConnection)
+except ImportError:
+    GSHEETS_ENABLED = False
+    conn = None
+
+
+def require_email() -> bool:
+    """이메일을 이미 남겼으면 True, 아니면 입력폼을 보여주고 False 반환."""
+    if st.session_state.get("lead_email"):
+        return True
+
+    st.info("🔒 AI 분석은 이메일 등록 후 이용 가능합니다.")
+    with st.form("lead_form", clear_on_submit=True):
+        email = st.text_input("이메일 주소", placeholder="your.email@example.com")
+        submitted = st.form_submit_button("등록하고 계속하기", use_container_width=True)
+
+    if submitted and email:
+        try:
+            if GSHEETS_ENABLED and conn is not None:
+                # Google Sheets에 이메일 저장
+                existing = conn.read(worksheet="leads", ttl=0)
+                new_row = pd.DataFrame({
+                    "timestamp": [datetime.now().isoformat()],
+                    "email": [email],
+                    "region": [st.session_state.get("selected_region", "")],
+                })
+                updated = pd.concat([existing, new_row], ignore_index=True)
+                conn.update(worksheet="leads", data=updated)
+            st.session_state.lead_email = email
+            st.success(f"✅ {email}로 등록되었습니다!")
+            st.rerun()
+        except Exception as e:
+            st.error(f"등록 오류: {e}")
+            return False
+    return False
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=600,
+            messages=[{"role": "user", "content": f"다음 결과를 설명해줘: {result}"}],
+        )
+        st.write(msg.content[0].text)
+
+
+
+
+## 여기까지 스트림릿 배포 연결
 
 
 st.set_page_config(
@@ -479,6 +530,10 @@ section[data-testid="stSidebar"] hr {
 # ── Run logic ─────────────────────────────────────────────────────────────────
 
 if run:
+    # 이메일 등록 확인
+    if not require_email():
+        st.stop()
+
     # 일일 Claude 호출 한도 확인
     allowed, used, limit = _check_daily_limit()
     if not allowed:
